@@ -723,7 +723,23 @@ app.post('/process-queue', async (req, res) => {
 
     for (const msg of messages) {
       const storeSessionId = msg.store_id;
-      const session = storeSessionId ? sessions[storeSessionId] : null;
+      let session = storeSessionId ? sessions[storeSessionId] : null;
+
+      // Auto-connect if marked connected in DB but missing from memory (e.g. after Render restart)
+      if (storeSessionId && (!session || session.connectionStatus !== 'connected')) {
+        const { data: dbSess } = await supabase
+          .from('whatsapp_sessions')
+          .select('status')
+          .eq('session_id', storeSessionId)
+          .maybeSingle();
+
+        if (dbSess && dbSess.status === 'connected') {
+          log('🔄', `Auto-triggering connection for active DB session ${storeSessionId}...`);
+          startConnection(storeSessionId);
+          await delay(2000); // Give socket a moment to establish
+          session = sessions[storeSessionId];
+        }
+      }
 
       // ── Primary path: the store's own session is connected ──
       if (session && session.connectionStatus === 'connected' && session.sock) {
