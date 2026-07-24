@@ -118,6 +118,7 @@ async function drainSessionQueue(sessionId) {
 
       await session.sock.sendMessage(recipientJid, { text: msg.message });
       await session.sock.sendPresenceUpdate('paused', recipientJid);
+      totalMessagesSent++;
 
       // Update DB: mark as sent
       if (msg.id) {
@@ -418,15 +419,26 @@ async function startConnection(sessionId) {
   }
 }
 
+// Track in-memory sent counter
+let totalMessagesSent = 0;
+
 // ─────────────────────────────────────────────
 // Public Health Check (for Render / Uptime Pings)
 // ─────────────────────────────────────────────
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  const activeCount = Object.values(sessions).filter(s => s.connectionStatus === 'connected').length;
+  let dbSentCount = totalMessagesSent;
+  try {
+    const { count } = await supabase.from('whatsapp_queue').select('*', { count: 'exact', head: true }).eq('status', 'sent');
+    if (count !== null && count !== undefined) dbSentCount = count;
+  } catch (e) {}
+
   res.json({
     status: 'ok',
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
-    active_sessions: Object.keys(sessions).length,
+    active_sessions: activeCount,
+    messages_sent: dbSentCount,
   });
 });
 
@@ -783,7 +795,21 @@ app.post('/process-queue', async (req, res) => {
     }
 
     log('📊', `Queue routing: ${enqueued} enqueued, ${skipped} skipped (not connected)`);
-    res.json({ success: true, enqueued, skipped, total: messages.length });
+    const activeCount = Object.values(sessions).filter(s => s.connectionStatus === 'connected').length;
+    let dbSentCount = totalMessagesSent;
+    try {
+      const { count } = await supabase.from('whatsapp_queue').select('*', { count: 'exact', head: true }).eq('status', 'sent');
+      if (count !== null && count !== undefined) dbSentCount = count;
+    } catch (e) {}
+
+    res.json({
+      success: true,
+      active_sessions: activeCount,
+      messages_sent: dbSentCount,
+      enqueued,
+      skipped,
+      total: messages.length
+    });
   } catch (err) {
     log('❌', `Queue routing error: ${err.message}`);
     res.json({ success: false, error: err.message });
