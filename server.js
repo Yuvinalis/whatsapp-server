@@ -380,6 +380,14 @@ async function startConnection(sessionId) {
           if (fs.existsSync(sessionAuthDir)) {
             fs.rmSync(sessionAuthDir, { recursive: true, force: true });
           }
+          await updateSessionStatus(sessionId, {
+            status: 'disconnected',
+            phone: null,
+            qr_code: null,
+          });
+          if (sessions[sessionId]) {
+            delete sessions[sessionId];
+          }
         }
 
         if (shouldReconnect) {
@@ -396,6 +404,9 @@ async function startConnection(sessionId) {
             phone: null,
             qr_code: null,
           });
+          if (sessions[sessionId]) {
+            delete sessions[sessionId];
+          }
         }
       }
     });
@@ -816,8 +827,24 @@ app.listen(PORT, async () => {
 
   for (const sessionId of subdirs) {
     const sessionAuthDir = path.join(AUTH_DIR, sessionId);
-    if (fs.readdirSync(sessionAuthDir).length > 0) {
-      log('🔄', `Found existing auth session for ${sessionId} — auto-reconnecting...`);
+
+    // Verify if this session is marked connected in Supabase DB
+    const { data: dbSess } = await supabase
+      .from('whatsapp_sessions')
+      .select('status, creds')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+
+    if (!dbSess || dbSess.status === 'disconnected' || !dbSess.creds) {
+      log('🧹', `Cleaning up orphan/disconnected local auth files for session ${sessionId}...`);
+      if (fs.existsSync(sessionAuthDir)) {
+        fs.rmSync(sessionAuthDir, { recursive: true, force: true });
+      }
+      if (sessions[sessionId]) {
+        delete sessions[sessionId];
+      }
+    } else if (fs.readdirSync(sessionAuthDir).length > 0) {
+      log('🔄', `Found valid active auth session for ${sessionId} — auto-reconnecting...`);
       startConnection(sessionId);
     }
   }
