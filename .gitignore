@@ -1,0 +1,7 @@
+node_modules/
+auth_sessions/
+.env
+cloudflared.exe
+config.yml
+*.tmp
+

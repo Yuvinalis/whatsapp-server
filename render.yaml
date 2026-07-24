@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: openclaw-whatsapp-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: WHATSAPP_API_SECRET
+        sync: false
+      - key: INTER_MESSAGE_DELAY_MS
+        value: 1500
+      - key: MAX_CONCURRENT_DRAINS
+        value: 5
