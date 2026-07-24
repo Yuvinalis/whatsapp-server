@@ -426,7 +426,19 @@ let totalMessagesSent = 0;
 // Public Health Check (for Render / Uptime Pings)
 // ─────────────────────────────────────────────
 app.get('/health', async (req, res) => {
-  const activeCount = Object.values(sessions).filter(s => s.connectionStatus === 'connected').length;
+  // Count from in-memory sessions (authoritative for this instance)
+  const inMemoryCount = Object.values(sessions).filter(s => s.connectionStatus === 'connected').length;
+
+  // Also count from Supabase DB — the DB is the source of truth after restarts
+  let dbActiveCount = inMemoryCount;
+  try {
+    const { count } = await supabase.from('whatsapp_sessions').select('*', { count: 'exact', head: true }).eq('status', 'connected');
+    if (count !== null && count !== undefined) dbActiveCount = count;
+  } catch (e) {}
+
+  // Use whichever is higher (DB has connected records even if in-memory is still warming up)
+  const activeCount = Math.max(inMemoryCount, dbActiveCount);
+
   let dbSentCount = totalMessagesSent;
   try {
     const { count } = await supabase.from('whatsapp_queue').select('*', { count: 'exact', head: true }).eq('status', 'sent');
@@ -438,6 +450,8 @@ app.get('/health', async (req, res) => {
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
     active_sessions: activeCount,
+    in_memory_sessions: inMemoryCount,
+    db_sessions: dbActiveCount,
     messages_sent: dbSentCount,
   });
 });
@@ -763,38 +777,70 @@ app.post('/process-queue', async (req, res) => {
     if (fetchErr) throw fetchErr;
 
     if (!messages || messages.length === 0) {
-      return res.json({ success: true, details: 'No pending messages', count: 0 });
+      const activeCount = Object.values(sessions).filter(s => s.connectionStatus === 'connected').length;
+      return res.json({ success: true, details: 'No pending messages', count: 0, active_sessions: activeCount });
     }
 
     log('📨', `Fetched ${messages.length} pending DB message(s) — routing to session queues`);
+
+    // Build a list of all currently-connected sessions for fallback routing
+    const connectedSessionIds = Object.entries(sessions)
+      .filter(([, s]) => s.connectionStatus === 'connected' && s.sock)
+      .map(([id]) => id);
 
     let enqueued = 0;
     let skipped = 0;
 
     for (const msg of messages) {
-      const sessionId = msg.store_id || 'admin_session';
-      const session = sessions[sessionId];
+      const storeSessionId = msg.store_id;
+      const session = storeSessionId ? sessions[storeSessionId] : null;
 
-      if (!session || session.connectionStatus !== 'connected' || !session.sock) {
-        log('⚠️', `Session ${sessionId} not connected — skipping DB msg ID: ${msg.id}`);
-        await supabase.from('whatsapp_queue').update({
-          status: 'failed',
-          error_message: `WhatsApp is not connected for session ${sessionId}. Link device first.`,
-        }).eq('id', msg.id);
-        skipped++;
+      // ── Primary path: the store's own session is connected ──
+      if (session && session.connectionStatus === 'connected' && session.sock) {
+        enqueueMessage(storeSessionId, {
+          id: msg.id,
+          phone: msg.phone,
+          message: msg.message,
+          retry_count: msg.retry_count || 0,
+        });
+        enqueued++;
         continue;
       }
 
-      enqueueMessage(sessionId, {
-        id: msg.id,
-        phone: msg.phone,
-        message: msg.message,
-        retry_count: msg.retry_count || 0,
-      });
-      enqueued++;
+      // ── Fallback: use any other connected session ──
+      // This handles the case where the server just restarted and this store's
+      // session isn't in memory yet, but another store's session is ready.
+      if (connectedSessionIds.length > 0) {
+        // Prefer first connected session; ideally the store session if it ever comes up
+        const fallbackSessionId = connectedSessionIds[0];
+        log('🔄', `Session ${storeSessionId} not ready — routing msg ${msg.id} via fallback session ${fallbackSessionId}`);
+        enqueueMessage(fallbackSessionId, {
+          id: msg.id,
+          phone: msg.phone,
+          message: msg.message,
+          retry_count: msg.retry_count || 0,
+        });
+        enqueued++;
+        continue;
+      }
+
+      // ── No connected session available at all ──
+      log('⚠️', `No connected session available — deferring msg ${msg.id} for store ${storeSessionId}`);
+      // Don't mark as failed immediately — leave as pending so it retries on next ping
+      // Only mark failed if it has been pending too long (over 5 minutes)
+      const createdAt = new Date(msg.created_at).getTime();
+      const ageMs = Date.now() - createdAt;
+      if (ageMs > 5 * 60 * 1000) {
+        await supabase.from('whatsapp_queue').update({
+          status: 'failed',
+          error_message: `No connected WhatsApp session available for store ${storeSessionId} after 5 minutes. Please link a WhatsApp device.`,
+        }).eq('id', msg.id);
+        skipped++;
+      }
+      // else: leave as pending, will retry on next /process-queue call
     }
 
-    log('📊', `Queue routing: ${enqueued} enqueued, ${skipped} skipped (not connected)`);
+    log('📊', `Queue routing: ${enqueued} enqueued, ${skipped} failed (no session after timeout)`);
     const activeCount = Object.values(sessions).filter(s => s.connectionStatus === 'connected').length;
     let dbSentCount = totalMessagesSent;
     try {
