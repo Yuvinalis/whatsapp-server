@@ -202,84 +202,14 @@ async function updateSessionStatus(sessionId, updates) {
 async function restoreAuthFromSupabase(sessionId) {
   const sessionAuthDir = path.join(AUTH_DIR, sessionId);
   const credsFile = path.join(sessionAuthDir, 'creds.json');
-
-  // If local creds file already exists, skip DB download
-  if (fs.existsSync(credsFile)) return true;
-
-  try {
-    const { data, error } = await supabase
-      .from('whatsapp_sessions')
-      .select('creds, keys')
-      .eq('session_id', sessionId)
-      .maybeSingle();
-
-    if (error || !data || !data.creds) {
-      return false;
-    }
-
-    if (!fs.existsSync(sessionAuthDir)) {
-      fs.mkdirSync(sessionAuthDir, { recursive: true });
-    }
-
-    fs.writeFileSync(credsFile, JSON.stringify(data.creds, null, 2));
-
-    if (data.keys && typeof data.keys === 'object') {
-      for (const [filename, content] of Object.entries(data.keys)) {
-        const filePath = path.join(sessionAuthDir, filename);
-        if (typeof content === 'object') {
-          fs.writeFileSync(filePath, JSON.stringify(content, null, 2));
-        } else if (typeof content === 'string') {
-          fs.writeFileSync(filePath, content);
-        }
-      }
-    }
-
-    log('💾', `[Session ${sessionId}] Restored auth credentials from Supabase DB!`);
-    return true;
-  } catch (err) {
-    log('⚠️', `[Session ${sessionId}] Could not restore auth from Supabase: ${err.message}`);
-    return false;
-  }
+  return fs.existsSync(credsFile);
 }
 
 /**
  * Saves current local auth files to Supabase (whatsapp_sessions table)
  */
 async function saveAuthToSupabase(sessionId) {
-  const sessionAuthDir = path.join(AUTH_DIR, sessionId);
-  const credsFile = path.join(sessionAuthDir, 'creds.json');
-
-  if (!fs.existsSync(credsFile)) return;
-
-  try {
-    const credsContent = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
-    const keyFiles = fs.readdirSync(sessionAuthDir).filter(f => f !== 'creds.json');
-    const keysMap = {};
-
-    for (const file of keyFiles) {
-      const filePath = path.join(sessionAuthDir, file);
-      try {
-        const fileData = fs.readFileSync(filePath, 'utf-8');
-        keysMap[file] = JSON.parse(fileData);
-      } catch (e) {
-        keysMap[file] = fs.readFileSync(filePath, 'utf-8');
-      }
-    }
-
-    await supabase.from('whatsapp_sessions').upsert(
-      {
-        session_id: sessionId,
-        creds: credsContent,
-        keys: keysMap,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'session_id' }
-    );
-
-    log('☁️', `[Session ${sessionId}] Auth credentials backed up to Supabase DB`);
-  } catch (err) {
-    log('❌', `[Session ${sessionId}] Failed to backup auth to Supabase: ${err.message}`);
-  }
+  // Credentials are store locally in auth_sessions folder
 }
 
 // ─────────────────────────────────────────────
@@ -875,22 +805,7 @@ app.listen(PORT, async () => {
     fs.mkdirSync(AUTH_DIR, { recursive: true });
   }
 
-  // Restore any saved sessions from Supabase DB to local disk before auto-reconnecting
-  try {
-    const { data: dbSessions } = await supabase
-      .from('whatsapp_sessions')
-      .select('session_id, creds')
-      .not('creds', 'is', null);
 
-    if (dbSessions && dbSessions.length > 0) {
-      log('📥', `Found ${dbSessions.length} auth session(s) in Supabase DB — checking/restoring...`);
-      for (const dbSess of dbSessions) {
-        await restoreAuthFromSupabase(dbSess.session_id);
-      }
-    }
-  } catch (e) {
-    log('⚠️', `Failed to restore auth sessions from Supabase DB on boot: ${e.message}`);
-  }
 
   // Scan and reconnect all saved sessions
   const subdirs = fs.readdirSync(AUTH_DIR).filter(file => {
@@ -903,11 +818,11 @@ app.listen(PORT, async () => {
     // Verify if this session is marked connected in Supabase DB
     const { data: dbSess } = await supabase
       .from('whatsapp_sessions')
-      .select('status, creds')
+      .select('status')
       .eq('session_id', sessionId)
       .maybeSingle();
 
-    if (!dbSess || dbSess.status === 'disconnected' || !dbSess.creds) {
+    if (!dbSess || dbSess.status === 'disconnected') {
       log('🧹', `Cleaning up orphan/disconnected local auth files for session ${sessionId}...`);
       if (fs.existsSync(sessionAuthDir)) {
         fs.rmSync(sessionAuthDir, { recursive: true, force: true });
