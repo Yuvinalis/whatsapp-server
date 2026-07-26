@@ -69,6 +69,7 @@ function getOrCreateSession(sessionId) {
       connectionStatus: 'disconnected',
       currentPhone: null,
       isConnecting: false,
+      qrTimeoutTimer: null,
       // In-memory per-session FIFO queue of { id, phone, message } objects
       queue: [],
       // Whether this session's drain loop is currently running
@@ -262,6 +263,31 @@ async function startConnection(sessionId) {
       if (qr) {
         log('📱', `[Session ${sessionId}] QR Code received — scan with your phone`);
         session.connectionStatus = 'qrcode';
+
+        // 2-minute QR code expiration timer
+        if (session.qrTimeoutTimer) {
+          clearTimeout(session.qrTimeoutTimer);
+        }
+        session.qrTimeoutTimer = setTimeout(async () => {
+          log('⏰', `[Session ${sessionId}] QR code expired after 2 minutes — stopping connection attempt`);
+          if (session.sock) {
+            try {
+              session.sock.ev.removeAllListeners('connection.update');
+              session.sock.end();
+            } catch (e) {}
+            session.sock = null;
+          }
+          session.connectionStatus = 'disconnected';
+          session.isConnecting = false;
+          session.qrCode = null;
+          session.qrTimeoutTimer = null;
+          await updateSessionStatus(sessionId, {
+            status: 'disconnected',
+            phone: null,
+            qr_code: null,
+          });
+        }, 120000);
+
         try {
           const qrDataUrl = await QRCode.toDataURL(qr);
           session.qrCode = qrDataUrl;
@@ -278,6 +304,10 @@ async function startConnection(sessionId) {
       // ── Connection Opened ──
       if (connection === 'open') {
         log('✅', `[Session ${sessionId}] WhatsApp connected successfully!`);
+        if (session.qrTimeoutTimer) {
+          clearTimeout(session.qrTimeoutTimer);
+          session.qrTimeoutTimer = null;
+        }
         session.connectionStatus = 'connected';
         session.isConnecting = false;
         session.qrCode = null;
@@ -298,11 +328,17 @@ async function startConnection(sessionId) {
 
       // ── Connection Closed ──
       if (connection === 'close') {
+        const wasConnected = session.connectionStatus === 'connected';
+        if (session.qrTimeoutTimer) {
+          clearTimeout(session.qrTimeoutTimer);
+          session.qrTimeoutTimer = null;
+        }
         session.isConnecting = false;
         session.qrCode = null;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405;
-        const shouldReconnect = !isLoggedOut;
+        // Only auto-reconnect if it was previously connected and not logged out
+        const shouldReconnect = !isLoggedOut && wasConnected;
 
         log('🔌', `[Session ${sessionId}] Connection closed. Code: ${statusCode}. Reconnecting: ${shouldReconnect}`);
 
@@ -476,6 +512,10 @@ app.post('/disconnect', async (req, res) => {
     }
 
     if (session) {
+      if (session.qrTimeoutTimer) {
+        clearTimeout(session.qrTimeoutTimer);
+        session.qrTimeoutTimer = null;
+      }
       session.connectionStatus = 'disconnected';
       session.currentPhone = null;
       session.isConnecting = false;
@@ -753,22 +793,9 @@ app.post('/process-queue', async (req, res) => {
         continue;
       }
 
-      // ── Fallback: use any other connected session ──
-      // This handles the case where the server just restarted and this store's
-      // session isn't in memory yet, but another store's session is ready.
-      if (connectedSessionIds.length > 0) {
-        // Prefer first connected session; ideally the store session if it ever comes up
-        const fallbackSessionId = connectedSessionIds[0];
-        log('🔄', `Session ${storeSessionId} not ready — routing msg ${msg.id} via fallback session ${fallbackSessionId}`);
-        enqueueMessage(fallbackSessionId, {
-          id: msg.id,
-          phone: msg.phone,
-          message: msg.message,
-          retry_count: msg.retry_count || 0,
-        });
-        enqueued++;
-        continue;
-      }
+      // ── No connected session for this store ──
+      // Do NOT fallback to another store's connected session to avoid cross-store messaging!
+      log('⚠️', `No connected session available for store ${storeSessionId} — deferring msg ${msg.id}`);
 
       // ── No connected session available at all ──
       log('⚠️', `No connected session available — deferring msg ${msg.id} for store ${storeSessionId}`);
