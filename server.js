@@ -266,8 +266,15 @@ async function startConnection(sessionId) {
     const sock = makeWASocket({
       version,
       auth: state,
-      browser: Browsers.ubuntu('Chrome'),
+      printQRInTerminal: false,
+      browser: ['Craft Store', 'Chrome', '120.0.0.0'],
       logger: pino({ level: 'silent' }),
+      syncFullHistory: false, // Prevents historic chat sync from blocking Node event loop & timing out connection
+      generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: true,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
     });
 
     session.sock = sock;
@@ -331,7 +338,8 @@ async function startConnection(sessionId) {
         session.connectionStatus = 'connected';
         session.isConnecting = false;
         session.qrCode = null;
-        session.currentPhone = sock.user?.id?.split(':')[0] || '';
+        session.currentPhone = (sock.user?.id || sock.user?.phone || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+        
         await updateSessionStatus(sessionId, {
           status: 'connected',
           phone: session.currentPhone,
@@ -355,27 +363,63 @@ async function startConnection(sessionId) {
         }
         session.isConnecting = false;
         session.qrCode = null;
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405;
-        // Only auto-reconnect if it was previously connected and not logged out
-        const shouldReconnect = !isLoggedOut && wasConnected;
 
-        log('🔌', `[Session ${sessionId}] Connection closed. Code: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+        const error = lastDisconnect?.error;
+        const statusCode = error?.output?.statusCode || error?.statusCode;
+        const errorMessage = error?.message || error?.toString() || '';
+
+        // Comprehensive check for device logout on phone / session expiration
+        const isLoggedOut =
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === 401 ||
+          statusCode === 403 ||
+          statusCode === 405 ||
+          errorMessage.toLowerCase().includes('logged out') ||
+          errorMessage.toLowerCase().includes('bad session') ||
+          errorMessage.toLowerCase().includes('unauthorized');
+
+        log('🔌', `[Session ${sessionId}] Connection closed. Code: ${statusCode || 'none'}. Error: "${errorMessage}". IsLoggedOut: ${isLoggedOut}`);
 
         if (isLoggedOut) {
-          log('🗑️', `[Session ${sessionId}] Clearing auth sessions due to logout/session expiration (code ${statusCode})...`);
+          log('🗑️', `[Session ${sessionId}] Session unlinked/logged out on phone (code ${statusCode || 'logout'}). Cleaning up auth state...`);
+
           if (fs.existsSync(sessionAuthDir)) {
             fs.rmSync(sessionAuthDir, { recursive: true, force: true });
           }
+
+          // If child stores were sharing this session, update them to disconnected gracefully
+          const { data: childStores } = await supabase
+            .from('whatsapp_sessions')
+            .select('session_id')
+            .eq('parent_session_id', sessionId);
+
+          if (childStores && childStores.length > 0) {
+            log('⚠️', `[Session ${sessionId}] Primary session logged out on phone. Marking ${childStores.length} child store(s) as disconnected.`);
+            await supabase
+              .from('whatsapp_sessions')
+              .update({
+                status: 'disconnected',
+                phone: null,
+                parent_session_id: null,
+                qr_code: null,
+                updated_at: new Date().toISOString()
+              })
+              .eq('parent_session_id', sessionId);
+          }
+
           await updateSessionStatus(sessionId, {
             status: 'disconnected',
             phone: null,
             qr_code: null,
           });
+
           if (sessions[sessionId]) {
             delete sessions[sessionId];
           }
+          return;
         }
+
+        const shouldReconnect = !isLoggedOut && wasConnected;
 
         if (shouldReconnect) {
           session.connectionStatus = 'connecting';
