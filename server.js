@@ -267,7 +267,7 @@ async function startConnection(sessionId) {
       version,
       auth: state,
       printQRInTerminal: false,
-      browser: ['Craft Store', 'Chrome', '120.0.0.0'],
+      browser: Browsers.ubuntu('Chrome'),
       logger: pino({ level: 'silent' }),
       syncFullHistory: false, // Prevents historic chat sync from blocking Node event loop & timing out connection
       generateHighQualityLinkPreview: false,
@@ -279,12 +279,30 @@ async function startConnection(sessionId) {
 
     session.sock = sock;
     sock.ev.on('creds.update', async () => {
+      // Clear QR expiration timer as soon as credentials update (QR scanned)
+      if (session.qrTimeoutTimer) {
+        clearTimeout(session.qrTimeoutTimer);
+        session.qrTimeoutTimer = null;
+      }
       await saveCreds();
       await saveAuthToSupabase(sessionId);
     });
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, qr, lastDisconnect } = update;
+
+      // ── Connecting / Linking State (e.g. after QR scan) ──
+      if (connection === 'connecting') {
+        if (session.connectionStatus === 'qrcode') {
+          log('⏳', `[Session ${sessionId}] QR code scanned! Linking device...`);
+          session.connectionStatus = 'connecting';
+          if (session.qrTimeoutTimer) {
+            clearTimeout(session.qrTimeoutTimer);
+            session.qrTimeoutTimer = null;
+          }
+          await updateSessionStatus(sessionId, { status: 'connecting', qr_code: null });
+        }
+      }
 
       // ── QR Code Received ──
       if (qr) {
@@ -296,6 +314,8 @@ async function startConnection(sessionId) {
           clearTimeout(session.qrTimeoutTimer);
         }
         session.qrTimeoutTimer = setTimeout(async () => {
+          if (session.connectionStatus === 'connected') return;
+
           log('⏰', `[Session ${sessionId}] QR code expired after 2 minutes — stopping connection attempt`);
           if (session.sock) {
             try {
@@ -419,13 +439,25 @@ async function startConnection(sessionId) {
           return;
         }
 
-        const shouldReconnect = !isLoggedOut && wasConnected;
+        const credsFile = path.join(sessionAuthDir, 'creds.json');
+        const hasCreds = fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10;
+        const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
+        const isTimedOut = statusCode === DisconnectReason.timedOut || statusCode === 408;
+
+        const shouldReconnect = !isLoggedOut && (
+          wasConnected ||
+          hasCreds ||
+          isRestartRequired ||
+          isTimedOut ||
+          session.connectionStatus === 'connecting'
+        );
 
         if (shouldReconnect) {
+          log('🔄', `[Session ${sessionId}] Connection dropped (${statusCode || 'reconnect'}). Reconnecting automatically...`);
           session.connectionStatus = 'connecting';
           await updateSessionStatus(sessionId, { status: 'connecting', qr_code: null });
-          // Exponential backoff reconnect (3s base)
-          setTimeout(() => startConnection(sessionId), 3000);
+          const delayMs = isRestartRequired ? 1000 : 3000;
+          setTimeout(() => startConnection(sessionId), delayMs);
         } else {
           session.connectionStatus = 'disconnected';
           session.currentPhone = null;
