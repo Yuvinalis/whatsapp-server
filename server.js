@@ -174,6 +174,13 @@ async function updateSessionStatus(sessionId, updates) {
     if (updates.status === 'disconnected') {
       const { error } = await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId);
       if (error) throw error;
+      
+      // Also update any child sessions sharing this session
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ status: 'disconnected', phone: null, updated_at: new Date().toISOString() })
+        .eq('parent_session_id', sessionId);
+
       log('🗑️', `[Session ${sessionId}] Disconnected session deleted from database`);
       return;
     }
@@ -187,6 +194,19 @@ async function updateSessionStatus(sessionId, updates) {
       { onConflict: 'session_id' }
     );
     if (error) throw error;
+
+    // Propagate status & phone to all child stores sharing this session
+    if (updates.status === 'connected' || updates.status === 'connecting') {
+      await supabase
+        .from('whatsapp_sessions')
+        .update({
+          status: updates.status,
+          phone: updates.phone ?? null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('parent_session_id', sessionId);
+    }
+
     log('📡', `[Session ${sessionId}] Status updated: ${JSON.stringify(updates)}`);
   } catch (err) {
     log('❌', `[Session ${sessionId}] Failed to update session in Supabase: ${err.message}`);
@@ -225,7 +245,7 @@ async function startConnection(sessionId) {
 
   session.isConnecting = true;
   session.connectionStatus = 'connecting';
-  await updateSessionStatus(sessionId, { status: 'connecting', qr_code: null });
+  await updateSessionStatus(sessionId, { status: 'connecting', qr_code: null, parent_session_id: null });
 
   try {
     let version = [2, 3000, 1015901307];
@@ -440,17 +460,42 @@ app.use(authMiddleware);
 // ─────────────────────────────────────────────
 
 // GET /status — Return current connection status for a session
-app.get('/status', (req, res) => {
+app.get('/status', async (req, res) => {
   const sessionId = req.query.session_id || req.body?.session_id || req.query.store_id || req.body?.store_id;
   if (!sessionId) {
     return res.status(400).json({ success: false, error: 'session_id or store_id is required' });
   }
-  const session = sessions[sessionId];
+
+  let session = sessions[sessionId];
+  let effectiveStatus = session ? session.connectionStatus : 'disconnected';
+  let effectivePhone = session ? session.currentPhone : null;
+  let effectiveQr = session ? session.qrCode : null;
+
+  if (effectiveStatus !== 'connected') {
+    const { data: dbSess } = await supabase
+      .from('whatsapp_sessions')
+      .select('status, phone, parent_session_id, qr_code')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+
+    if (dbSess) {
+      if (dbSess.parent_session_id && sessions[dbSess.parent_session_id]) {
+        const parent = sessions[dbSess.parent_session_id];
+        effectiveStatus = parent.connectionStatus;
+        effectivePhone = parent.currentPhone || dbSess.phone;
+      } else {
+        effectiveStatus = dbSess.status || effectiveStatus;
+        effectivePhone = dbSess.phone || effectivePhone;
+        effectiveQr = dbSess.qr_code || effectiveQr;
+      }
+    }
+  }
+
   res.json({
     success: true,
-    status: session ? session.connectionStatus : 'disconnected',
-    phone: session ? session.currentPhone : null,
-    qr_code: session ? session.qrCode : null,
+    status: effectiveStatus,
+    phone: effectivePhone,
+    qr_code: effectiveQr,
     queue_length: session ? session.queue.length : 0,
   });
 });
@@ -492,16 +537,119 @@ app.post('/connect', async (req, res) => {
   }
 });
 
-// POST /disconnect — Logout and clear session
+// POST /disconnect — Logout and clear session, or unlink shared session
 app.post('/disconnect', async (req, res) => {
   const sessionId = req.body.session_id || req.body.store_id;
   if (!sessionId) {
     return res.status(400).json({ success: false, error: 'session_id or store_id is required' });
   }
-  const session = sessions[sessionId];
-  const sessionAuthDir = path.join(AUTH_DIR, sessionId);
 
   try {
+    // 1) Read DB row for this session
+    const { data: dbSess } = await supabase
+      .from('whatsapp_sessions')
+      .select('session_id, parent_session_id, phone, status')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+
+    // CASE A: This store is a CHILD / SHARING store (parent_session_id is set)
+    if (dbSess?.parent_session_id) {
+      log('🔗', `[Disconnect] Unlinking child store "${sessionId}" from parent session "${dbSess.parent_session_id}"`);
+
+      await supabase
+        .from('whatsapp_sessions')
+        .update({
+          status: 'disconnected',
+          phone: null,
+          parent_session_id: null,
+          qr_code: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('session_id', sessionId);
+
+      if (sessions[sessionId]) {
+        delete sessions[sessionId];
+      }
+
+      return res.json({ success: true, status: 'disconnected', message: 'Unlinked from shared WhatsApp session.' });
+    }
+
+    // CASE B: This store is a PRIMARY / PARENT store
+    // Check if any OTHER stores are currently sharing this session
+    const { data: childStores } = await supabase
+      .from('whatsapp_sessions')
+      .select('session_id')
+      .eq('parent_session_id', sessionId);
+
+    if (childStores && childStores.length > 0) {
+      const newParentId = childStores[0].session_id;
+      log('👑', `[Disconnect] Primary store "${sessionId}" is unlinking, but ${childStores.length} store(s) share it. Promoting "${newParentId}" to primary session holder!`);
+
+      const oldAuthDir = path.join(AUTH_DIR, sessionId);
+      const newAuthDir = path.join(AUTH_DIR, newParentId);
+
+      // Transfer auth directory to the new primary session holder
+      if (fs.existsSync(oldAuthDir)) {
+        if (fs.existsSync(newAuthDir)) {
+          fs.rmSync(newAuthDir, { recursive: true, force: true });
+        }
+        fs.cpSync(oldAuthDir, newAuthDir, { recursive: true });
+        fs.rmSync(oldAuthDir, { recursive: true, force: true });
+      }
+
+      // Re-key in-memory active session map if present
+      if (sessions[sessionId]) {
+        sessions[newParentId] = sessions[sessionId];
+        delete sessions[sessionId];
+      }
+
+      // Promote the first child store to primary
+      await supabase
+        .from('whatsapp_sessions')
+        .update({
+          parent_session_id: null,
+          status: 'connected',
+          phone: dbSess?.phone,
+          updated_at: new Date().toISOString()
+        })
+        .eq('session_id', newParentId);
+
+      // Re-point remaining child stores to the new primary
+      if (childStores.length > 1) {
+        const remainingChildIds = childStores.slice(1).map(c => c.session_id);
+        await supabase
+          .from('whatsapp_sessions')
+          .update({
+            parent_session_id: newParentId,
+            updated_at: new Date().toISOString()
+          })
+          .in('session_id', remainingChildIds);
+      }
+
+      // Unlink the requesting store
+      await supabase
+        .from('whatsapp_sessions')
+        .update({
+          status: 'disconnected',
+          phone: null,
+          parent_session_id: null,
+          qr_code: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('session_id', sessionId);
+
+      return res.json({
+        success: true,
+        status: 'disconnected',
+        message: `Store unlinked. WhatsApp session promoted to ${newParentId} for remaining stores.`
+      });
+    }
+
+    // CASE C: Primary store with NO OTHER stores sharing it
+    log('🔌', `[Disconnect] Disconnecting primary store "${sessionId}" (no other stores sharing)...`);
+    const session = sessions[sessionId];
+    const sessionAuthDir = path.join(AUTH_DIR, sessionId);
+
     if (session && session.sock) {
       try {
         await session.sock.logout();
@@ -519,22 +667,29 @@ app.post('/disconnect', async (req, res) => {
       session.connectionStatus = 'disconnected';
       session.currentPhone = null;
       session.isConnecting = false;
-      // Clear any pending in-memory queue
       session.queue = [];
       session.isDraining = false;
     }
 
-    // Clean local auth files to force fresh QR on next connect
     if (fs.existsSync(sessionAuthDir)) {
       fs.rmSync(sessionAuthDir, { recursive: true, force: true });
       log('🗑️', `[Session ${sessionId}] Auth session files cleared`);
     }
 
-    await updateSessionStatus(sessionId, {
-      status: 'disconnected',
-      phone: null,
-      qr_code: null,
-    });
+    await supabase
+      .from('whatsapp_sessions')
+      .update({
+        status: 'disconnected',
+        phone: null,
+        parent_session_id: null,
+        qr_code: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('session_id', sessionId);
+
+    if (sessions[sessionId]) {
+      delete sessions[sessionId];
+    }
 
     res.json({ success: true, status: 'disconnected' });
   } catch (err) {
@@ -658,46 +813,57 @@ app.post('/reuse-session', async (req, res) => {
     return res.status(400).json({ success: false, error: 'from_session_id and to_session_id must differ' });
   }
 
-  const fromAuthDir = path.join(AUTH_DIR, fromId);
   const toAuthDir = path.join(AUTH_DIR, toId);
 
-  if (!fs.existsSync(fromAuthDir)) {
-    return res.json({ success: false, error: `Source session "${fromId}" has no auth files on this server.` });
-  }
-
   try {
-    // 1) Copy the auth folder to target
+    // Determine the root parent session ID
+    const { data: sourceRow } = await supabase
+      .from('whatsapp_sessions')
+      .select('phone, parent_session_id, status')
+      .eq('session_id', fromId)
+      .maybeSingle();
+
+    const rootParentId = sourceRow?.parent_session_id || fromId;
+
+    const { data: rootRow } = await supabase
+      .from('whatsapp_sessions')
+      .select('phone, status')
+      .eq('session_id', rootParentId)
+      .maybeSingle();
+
+    const phone = rootRow?.phone || sourceRow?.phone || sessions[rootParentId]?.currentPhone || null;
+    const status = rootRow?.status || sourceRow?.status || (sessions[rootParentId]?.connectionStatus === 'connected' ? 'connected' : 'disconnected');
+
+    // Clean up any local auth files for target so it doesn't run a separate socket
     if (fs.existsSync(toAuthDir)) {
       fs.rmSync(toAuthDir, { recursive: true, force: true });
     }
-    fs.cpSync(fromAuthDir, toAuthDir, { recursive: true });
-    log('📦', `[Reuse] Copied auth files from "${fromId}" → "${toId}"`);
+    if (sessions[toId]) {
+      if (sessions[toId].sock) {
+        try { await sessions[toId].sock.logout(); } catch (e) {}
+      }
+      delete sessions[toId];
+    }
 
-    // 2) Get source session phone number
-    const { data: sourceRow } = await supabase
-      .from('whatsapp_sessions')
-      .select('phone')
-      .eq('session_id', fromId)
-      .maybeSingle();
-    const phone = sourceRow?.phone || sessions[fromId]?.currentPhone || null;
-
-    // 3) Upsert target whatsapp_sessions row
+    // Upsert target whatsapp_sessions row pointing to rootParentId as parent
     const { error: targetErr } = await supabase
       .from('whatsapp_sessions')
       .upsert({
         session_id: toId,
-        status: 'connected',
-        phone,
+        parent_session_id: rootParentId,
+        status: status,
+        phone: phone,
         qr_code: null,
         updated_at: new Date().toISOString()
       }, { onConflict: 'session_id' });
+
     if (targetErr) throw targetErr;
 
-    // 4) Start target connection socket
-    startConnection(toId);
+    // DO NOT start a new connection/socket for toId.
+    // rootParentId's active Baileys socket is shared seamlessly!
 
-    log('✅', `[Reuse] Session reused for store ${toId} from ${fromId} (phone: ${phone || 'unknown'})`);
-    res.json({ success: true, status: 'connected', phone });
+    log('✅', `[Reuse] Session shared for store ${toId} from root parent ${rootParentId} (phone: ${phone || 'unknown'})`);
+    res.json({ success: true, status: status, phone });
   } catch (err) {
     log('❌', `[Reuse] Error: ${err.message}`);
     res.json({ success: false, error: err.message });
@@ -705,7 +871,6 @@ app.post('/reuse-session', async (req, res) => {
 });
 
 // POST /send-message — Enqueue a single message for immediate async delivery
-// Returns 202 Accepted immediately; the message drains in the background.
 // Body: { session_id, phone, message }
 app.post('/send-message', async (req, res) => {
   const { session_id, phone, message } = req.body;
@@ -713,31 +878,48 @@ app.post('/send-message', async (req, res) => {
     return res.status(400).json({ success: false, error: 'phone and message are required' });
   }
 
-  const sessionId = session_id || 'admin_session';
-  const session = sessions[sessionId];
+  let targetSessionId = session_id || 'admin_session';
+  let session = sessions[targetSessionId];
+
+  // If not directly connected in memory, resolve parent_session_id or phone match
+  if (!session || session.connectionStatus !== 'connected') {
+    const { data: dbSess } = await supabase
+      .from('whatsapp_sessions')
+      .select('parent_session_id, phone')
+      .eq('session_id', targetSessionId)
+      .maybeSingle();
+
+    if (dbSess?.parent_session_id && sessions[dbSess.parent_session_id]?.connectionStatus === 'connected') {
+      targetSessionId = dbSess.parent_session_id;
+      session = sessions[targetSessionId];
+    } else if (dbSess?.phone) {
+      const match = Object.entries(sessions).find(([, s]) => s.connectionStatus === 'connected' && s.currentPhone === dbSess.phone);
+      if (match) {
+        targetSessionId = match[0];
+        session = match[1];
+      }
+    }
+  }
 
   if (!session || session.connectionStatus !== 'connected') {
     return res.status(503).json({
       success: false,
-      error: `Session "${sessionId}" is not connected. Link a WhatsApp device first.`,
+      error: `Session "${session_id}" is not connected. Link a WhatsApp device first.`,
     });
   }
 
-  // Enqueue and return immediately (fire-and-forget drain)
-  enqueueMessage(sessionId, { id: null, phone, message });
+  enqueueMessage(targetSessionId, { id: null, phone, message });
 
   res.status(202).json({
     success: true,
     message: 'Message enqueued for delivery',
-    queue_position: sessions[sessionId]?.queue.length ?? 1,
+    queue_position: sessions[targetSessionId]?.queue.length ?? 1,
   });
 });
 
 // POST /process-queue — Pull pending messages from Supabase whatsapp_queue and enqueue them
-// Called by an Edge Function or cron to feed the DB queue into per-session in-memory queues.
 app.post('/process-queue', async (req, res) => {
   try {
-    // Fetch pending messages from DB queue
     const { data: messages, error: fetchErr } = await supabase
       .from('whatsapp_queue')
       .select('*')
@@ -753,37 +935,63 @@ app.post('/process-queue', async (req, res) => {
 
     log('📨', `Fetched ${messages.length} pending DB message(s) — routing to session queues`);
 
-    // Build a list of all currently-connected sessions for fallback routing
-    const connectedSessionIds = Object.entries(sessions)
-      .filter(([, s]) => s.connectionStatus === 'connected' && s.sock)
-      .map(([id]) => id);
-
     let enqueued = 0;
     let skipped = 0;
 
     for (const msg of messages) {
       const storeSessionId = msg.store_id;
       let session = storeSessionId ? sessions[storeSessionId] : null;
+      let activeSessionId = storeSessionId;
 
-      // Auto-connect if marked connected in DB but missing from memory (e.g. after Render restart)
+      // ── Resolve session via parent_session_id or phone match if not directly connected ──
       if (storeSessionId && (!session || session.connectionStatus !== 'connected')) {
         const { data: dbSess } = await supabase
           .from('whatsapp_sessions')
-          .select('status')
+          .select('status, phone, parent_session_id')
           .eq('session_id', storeSessionId)
           .maybeSingle();
 
-        if (dbSess && dbSess.status === 'connected') {
+        if (dbSess?.parent_session_id) {
+          const parentId = dbSess.parent_session_id;
+          activeSessionId = parentId;
+          session = sessions[parentId];
+
+          if (!session || session.connectionStatus !== 'connected') {
+            const { data: parentDbSess } = await supabase
+              .from('whatsapp_sessions')
+              .select('status')
+              .eq('session_id', parentId)
+              .maybeSingle();
+
+            if (parentDbSess && parentDbSess.status === 'connected') {
+              log('🔄', `Auto-triggering connection for parent DB session ${parentId}...`);
+              startConnection(parentId);
+              await delay(2000);
+              session = sessions[parentId];
+            }
+          }
+        } else if (dbSess && dbSess.status === 'connected') {
           log('🔄', `Auto-triggering connection for active DB session ${storeSessionId}...`);
           startConnection(storeSessionId);
-          await delay(2000); // Give socket a moment to establish
+          await delay(2000);
           session = sessions[storeSessionId];
+        }
+
+        // Phone fallback matching
+        if ((!session || session.connectionStatus !== 'connected') && dbSess?.phone) {
+          const match = Object.entries(sessions).find(
+            ([, s]) => s.connectionStatus === 'connected' && s.sock && s.currentPhone === dbSess.phone
+          );
+          if (match) {
+            activeSessionId = match[0];
+            session = match[1];
+          }
         }
       }
 
-      // ── Primary path: the store's own session is connected ──
+      // ── Enqueue if a connected session socket was found ──
       if (session && session.connectionStatus === 'connected' && session.sock) {
-        enqueueMessage(storeSessionId, {
+        enqueueMessage(activeSessionId, {
           id: msg.id,
           phone: msg.phone,
           message: msg.message,
@@ -793,14 +1001,8 @@ app.post('/process-queue', async (req, res) => {
         continue;
       }
 
-      // ── No connected session for this store ──
-      // Do NOT fallback to another store's connected session to avoid cross-store messaging!
       log('⚠️', `No connected session available for store ${storeSessionId} — deferring msg ${msg.id}`);
 
-      // ── No connected session available at all ──
-      log('⚠️', `No connected session available — deferring msg ${msg.id} for store ${storeSessionId}`);
-      // Don't mark as failed immediately — leave as pending so it retries on next ping
-      // Only mark failed if it has been pending too long (over 5 minutes)
       const createdAt = new Date(msg.created_at).getTime();
       const ageMs = Date.now() - createdAt;
       if (ageMs > 5 * 60 * 1000) {
@@ -810,7 +1012,6 @@ app.post('/process-queue', async (req, res) => {
         }).eq('id', msg.id);
         skipped++;
       }
-      // else: leave as pending, will retry on next /process-queue call
     }
 
     log('📊', `Queue routing: ${enqueued} enqueued, ${skipped} failed (no session after timeout)`);
@@ -858,15 +1059,15 @@ app.listen(PORT, async () => {
   for (const sessionId of subdirs) {
     const sessionAuthDir = path.join(AUTH_DIR, sessionId);
 
-    // Verify if this session is marked connected in Supabase DB
+    // Verify if this session is marked connected in Supabase DB as a primary session
     const { data: dbSess } = await supabase
       .from('whatsapp_sessions')
-      .select('status')
+      .select('status, parent_session_id')
       .eq('session_id', sessionId)
       .maybeSingle();
 
-    if (!dbSess || dbSess.status === 'disconnected') {
-      log('🧹', `Cleaning up orphan/disconnected local auth files for session ${sessionId}...`);
+    if (!dbSess || dbSess.status === 'disconnected' || dbSess.parent_session_id) {
+      log('🧹', `Cleaning up orphan/child local auth files for session ${sessionId}...`);
       if (fs.existsSync(sessionAuthDir)) {
         fs.rmSync(sessionAuthDir, { recursive: true, force: true });
       }
@@ -874,7 +1075,7 @@ app.listen(PORT, async () => {
         delete sessions[sessionId];
       }
     } else if (fs.readdirSync(sessionAuthDir).length > 0) {
-      log('🔄', `Found valid active auth session for ${sessionId} — auto-reconnecting...`);
+      log('🔄', `Found valid active primary auth session for ${sessionId} — auto-reconnecting...`);
       startConnection(sessionId);
     }
   }
