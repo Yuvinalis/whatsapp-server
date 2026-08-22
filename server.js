@@ -427,7 +427,7 @@ async function startConnection(sessionId) {
         if (isLoggedOut) {
           log('🗑️', `[Session ${sessionId}] Session unlinked/logged out on phone (code ${statusCode || 'logout'}). Cleaning up auth state...`);
 
-          if (fs.existsSync(sessionAuthDir)) {
+          if (fs.existsSync(sessionAuthDir) && sessionAuthDir !== AUTH_DIR) {
             fs.rmSync(sessionAuthDir, { recursive: true, force: true });
           }
 
@@ -1058,9 +1058,16 @@ app.post('/disconnect', async (req, res) => {
       session.isDraining = false;
     }
 
-    if (fs.existsSync(sessionAuthDir)) {
+    if (fs.existsSync(sessionAuthDir) && sessionAuthDir !== AUTH_DIR) {
       fs.rmSync(sessionAuthDir, { recursive: true, force: true });
       log('🗑️', `[Session ${sessionId}] Auth session files cleared`);
+    } else if (sessionAuthDir === AUTH_DIR && fs.existsSync(AUTH_DIR)) {
+      const files = fs.readdirSync(AUTH_DIR);
+      for (const f of files) {
+        const p = path.join(AUTH_DIR, f);
+        if (fs.statSync(p).isFile()) fs.unlinkSync(p);
+      }
+      log('🗑️', `[Session ${sessionId}] Root auth session files cleared`);
     }
 
     await supabase
