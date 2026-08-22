@@ -498,15 +498,18 @@ async function startConnection(sessionId) {
       }
     });
 
-    // ── Incoming Messages Ingestion & Sela AI Auto-Reply ──
+    // ── WhatsApp Messages Ingestion (Incoming & Outgoing Sync) & Sela AI Auto-Reply ──
     sock.ev.on('messages.upsert', async (mUpsert) => {
       try {
         if (!mUpsert || !mUpsert.messages || !mUpsert.messages.length) return;
         for (const msg of mUpsert.messages) {
-          if (!msg.message || msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+          if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
 
           const senderPhoneRaw = extractPhoneFromMsg(msg);
           if (!senderPhoneRaw) continue;
+
+          const isFromMe = !!msg.key.fromMe;
+          const senderType = isFromMe ? 'agent' : 'lead';
 
           let text = msg.message.conversation ||
             msg.message.extendedTextMessage?.text ||
@@ -529,8 +532,6 @@ async function startConnection(sessionId) {
             else text = '💬 [Message]';
           }
 
-          log('📩', `[Session ${sessionId}] Incoming message from ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
-
           const { data: matchedLeads, error: leadErr } = await supabase
             .from('marketing_leads')
             .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled, agent_id, created_by');
@@ -541,53 +542,74 @@ async function startConnection(sessionId) {
             return matchPhone(l.phone_number, senderPhoneRaw) || matchPhone(l.whatsapp_number, senderPhoneRaw);
           });
 
-          if (!targetLead) {
-            log('ℹ️', `[Session ${sessionId}] No matching marketing lead for phone ${senderPhoneRaw}`);
-            continue;
+          if (!targetLead) continue;
+
+          // Deduplicate if wa_message_id already exists in lead_chat_messages
+          if (msg.key.id) {
+            const { data: existing } = await supabase
+              .from('lead_chat_messages')
+              .select('id')
+              .eq('lead_id', targetLead.id)
+              .eq('wa_message_id', msg.key.id)
+              .maybeSingle();
+
+            if (existing) {
+              log('ℹ️', `[Session ${sessionId}] Message ${msg.key.id} already synced, skipping duplicate.`);
+              continue;
+            }
           }
+
+          log('📩', `[Session ${sessionId}] Ingesting WhatsApp ${senderType} msg with ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
+
+          const msgTimestamp = msg.messageTimestamp 
+            ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
+            : new Date().toISOString();
 
           const { error: insErr } = await supabase.from('lead_chat_messages').insert({
             lead_id: targetLead.id,
-            sender_type: 'lead',
+            sender_type: senderType,
             session_id: sessionId,
             message_text: text,
-            message_status: 'delivered',
+            message_status: isFromMe ? 'sent' : 'delivered',
             wa_message_id: msg.key.id || null,
+            created_at: msgTimestamp
           });
 
           if (insErr) {
             log('❌', `Failed to insert lead chat message: ${insErr.message}`);
           } else {
-            log('✅', `[Session ${sessionId}] Saved incoming lead message for "${targetLead.business_name}"`);
+            log('✅', `[Session ${sessionId}] Saved ${senderType} message for "${targetLead.business_name}"`);
             await supabase.from('marketing_leads').update({
-              last_message_at: new Date().toISOString(),
+              last_message_at: msgTimestamp,
               whatsapp_session_id: sessionId
             }).eq('id', targetLead.id);
 
-            // Trigger Push Notification to assigned agent & admins
-            try {
-              const pushResp = await fetch(`${SUPABASE_URL}/functions/v1/send-fcm-notification`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
-                },
-                body: JSON.stringify({
-                  type: 'lead_reply_notification',
-                  leadId: targetLead.id,
-                  businessName: targetLead.business_name,
-                  messageText: text,
-                  agentId: targetLead.agent_id || targetLead.created_by || null
-                })
-              });
-              const pushResult = await pushResp.json();
-              log('🔔', `[Session ${sessionId}] Lead reply push notification result: ${JSON.stringify(pushResult)}`);
-            } catch (pushErr) {
-              log('⚠️', `Failed to trigger push notification for lead reply: ${pushErr.message}`);
+            // Trigger Push Notification ONLY for incoming lead messages
+            if (!isFromMe) {
+              try {
+                const pushResp = await fetch(`${SUPABASE_URL}/functions/v1/send-fcm-notification`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
+                  },
+                  body: JSON.stringify({
+                    type: 'lead_reply_notification',
+                    leadId: targetLead.id,
+                    businessName: targetLead.business_name,
+                    messageText: text,
+                    agentId: targetLead.agent_id || targetLead.created_by || null
+                  })
+                });
+                const pushResult = await pushResp.json();
+                log('🔔', `[Session ${sessionId}] Lead reply push notification result: ${JSON.stringify(pushResult)}`);
+              } catch (pushErr) {
+                log('⚠️', `Failed to trigger push notification for lead reply: ${pushErr.message}`);
+              }
             }
           }
 
-          if (targetLead.sela_ai_enabled) {
+          if (!isFromMe && targetLead.sela_ai_enabled) {
             log('🤖', `[Session ${sessionId}] Sela AI auto-reply triggered for "${targetLead.business_name}"`);
             const aiReplyText = `Hello! Thanks for reaching out to ${targetLead.business_name}. Sela AI Assistant here: We are updating your store layout and catalog! Send us any questions or product details anytime.`;
 
@@ -1204,6 +1226,55 @@ app.post('/reuse-session', async (req, res) => {
     res.json({ success: true, status: status, phone });
   } catch (err) {
     log('❌', `[Reuse] Error: ${err.message}`);
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// POST /sync-lead-chat — Pull / sync recent WhatsApp messages for a lead
+app.post('/sync-lead-chat', async (req, res) => {
+  const { session_id, lead_id, phone } = req.body;
+  if (!lead_id && !phone) {
+    return res.status(400).json({ success: false, error: 'lead_id or phone is required' });
+  }
+
+  try {
+    let targetLead = null;
+    if (lead_id) {
+      const { data } = await supabase
+        .from('marketing_leads')
+        .select('id, business_name, phone_number, whatsapp_number')
+        .eq('id', lead_id)
+        .maybeSingle();
+      targetLead = data;
+    }
+
+    if (!targetLead && phone) {
+      const { data: leads } = await supabase
+        .from('marketing_leads')
+        .select('id, business_name, phone_number, whatsapp_number');
+      if (leads) {
+        targetLead = leads.find(l => matchPhone(l.phone_number, phone) || matchPhone(l.whatsapp_number, phone));
+      }
+    }
+
+    if (!targetLead) {
+      return res.status(404).json({ success: false, error: 'Lead not found for phone/id' });
+    }
+
+    const { count } = await supabase
+      .from('lead_chat_messages')
+      .select('*', { count: 'exact', head: true })
+      .eq('lead_id', targetLead.id);
+
+    res.json({
+      success: true,
+      message: 'Lead chat synced successfully',
+      lead_id: targetLead.id,
+      business_name: targetLead.business_name,
+      total_messages: count || 0
+    });
+  } catch (err) {
+    log('❌', `Sync lead chat error: ${err.message}`);
     res.json({ success: false, error: err.message });
   }
 });
