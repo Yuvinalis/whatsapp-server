@@ -544,7 +544,22 @@ async function startConnection(sessionId) {
 
           if (!targetLead) continue;
 
-          // Deduplicate if wa_message_id already exists in lead_chat_messages
+          // Check if an unconfirmed optimistic message exists for this lead
+          let pendingMatchId = null;
+          if (isFromMe) {
+            const { data: pendingMsg } = await supabase
+              .from('lead_chat_messages')
+              .select('id')
+              .eq('lead_id', targetLead.id)
+              .eq('sender_type', 'agent')
+              .is('wa_message_id', null)
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            if (pendingMsg) pendingMatchId = pendingMsg.id;
+          }
+
           if (msg.key.id) {
             const { data: existing } = await supabase
               .from('lead_chat_messages')
@@ -565,24 +580,36 @@ async function startConnection(sessionId) {
             ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
             : new Date().toISOString();
 
-          const { error: insErr } = await supabase.from('lead_chat_messages').insert({
-            lead_id: targetLead.id,
-            sender_type: senderType,
-            session_id: sessionId,
-            message_text: text,
-            message_status: isFromMe ? 'sent' : 'delivered',
-            wa_message_id: msg.key.id || null,
-            created_at: msgTimestamp
-          });
-
-          if (insErr) {
-            log('❌', `Failed to insert lead chat message: ${insErr.message}`);
+          if (pendingMatchId) {
+            await supabase
+              .from('lead_chat_messages')
+              .update({
+                wa_message_id: msg.key.id || null,
+                message_status: 'sent',
+                created_at: msgTimestamp
+              })
+              .eq('id', pendingMatchId);
+            log('✅', `[Session ${sessionId}] Linked optimistic message ${pendingMatchId} with wa_message_id ${msg.key.id}`);
           } else {
-            log('✅', `[Session ${sessionId}] Saved ${senderType} message for "${targetLead.business_name}"`);
-            await supabase.from('marketing_leads').update({
-              last_message_at: msgTimestamp,
-              whatsapp_session_id: sessionId
-            }).eq('id', targetLead.id);
+            const { error: insErr } = await supabase.from('lead_chat_messages').insert({
+              lead_id: targetLead.id,
+              sender_type: senderType,
+              session_id: sessionId,
+              message_text: text,
+              message_status: isFromMe ? 'sent' : 'delivered',
+              wa_message_id: msg.key.id || null,
+              created_at: msgTimestamp
+            });
+
+            if (insErr) {
+              log('❌', `Failed to insert lead chat message: ${insErr.message}`);
+            }
+          }
+
+          await supabase.from('marketing_leads').update({
+            last_message_at: msgTimestamp,
+            whatsapp_session_id: sessionId
+          }).eq('id', targetLead.id);
 
             // Trigger Push Notification ONLY for incoming lead messages
             if (!isFromMe) {
