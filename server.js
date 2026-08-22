@@ -57,6 +57,41 @@ const formatJid = (phone) => {
   return `${clean}@s.whatsapp.net`;
 };
 
+const extractPhoneFromMsg = (msg) => {
+  const candidates = [
+    msg.key?.remoteJidAlt,
+    msg.key?.remoteJid,
+    msg.key?.participantAlt,
+    msg.key?.participant,
+    msg.participant,
+  ];
+  for (const cand of candidates) {
+    if (cand && typeof cand === 'string' && cand.includes('@s.whatsapp.net')) {
+      const phone = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
+      if (phone) return phone;
+    }
+  }
+  for (const cand of candidates) {
+    if (cand && typeof cand === 'string' && !cand.endsWith('@lid')) {
+      const phone = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
+      if (phone) return phone;
+    }
+  }
+  return null;
+};
+
+const matchPhone = (storedPhone, incomingPhone) => {
+  if (!storedPhone || !incomingPhone) return false;
+  const cleanStored = String(storedPhone).replace(/\D/g, '');
+  const cleanIncoming = String(incomingPhone).replace(/\D/g, '');
+  if (!cleanStored || !cleanIncoming) return false;
+  if (cleanStored === cleanIncoming) return true;
+  const s9 = cleanStored.length >= 9 ? cleanStored.slice(-9) : cleanStored;
+  const i9 = cleanIncoming.length >= 9 ? cleanIncoming.slice(-9) : cleanIncoming;
+  return s9 === i9;
+};
+
+
 const log = (emoji, msg) => {
   const timestamp = new Date().toLocaleTimeString();
   console.log(`${emoji} [${timestamp}] ${msg}`);
@@ -481,32 +516,40 @@ async function startConnection(sessionId) {
         for (const msg of mUpsert.messages) {
           if (!msg.message || msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
 
-          const remoteJid = msg.key.remoteJid || '';
-          const senderPhoneRaw = remoteJid.split('@')[0].split(':')[0].replace(/\D/g, '');
+          const senderPhoneRaw = extractPhoneFromMsg(msg);
           if (!senderPhoneRaw) continue;
 
-          const text = msg.message.conversation ||
+          let text = msg.message.conversation ||
             msg.message.extendedTextMessage?.text ||
             msg.message.imageMessage?.caption ||
             msg.message.videoMessage?.caption ||
             msg.message.documentMessage?.caption ||
+            msg.message.buttonsResponseMessage?.selectedDisplayText ||
+            msg.message.listResponseMessage?.title ||
+            msg.message.templateButtonReplyMessage?.selectedDisplayText ||
             '';
 
-          if (!text.trim() && !msg.message.imageMessage && !msg.message.documentMessage) continue;
+          if (!text.trim()) {
+            if (msg.message.imageMessage) text = '📷 [Image Attachment]';
+            else if (msg.message.videoMessage) text = '🎥 [Video Attachment]';
+            else if (msg.message.audioMessage) text = '🎵 [Audio Message]';
+            else if (msg.message.documentMessage) text = '📄 [Document Attachment]';
+            else if (msg.message.stickerMessage) text = '🎨 [Sticker]';
+            else if (msg.message.contactMessage || msg.message.contactsArrayMessage) text = '🎴 [Contact Card]';
+            else if (msg.message.locationMessage || msg.message.liveLocationMessage) text = '📍 [Location Pin]';
+            else text = '💬 [Message]';
+          }
 
           log('📩', `[Session ${sessionId}] Incoming message from ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
 
           const { data: matchedLeads, error: leadErr } = await supabase
             .from('marketing_leads')
-            .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled');
+            .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled, agent_id, created_by');
 
           if (leadErr || !matchedLeads) continue;
 
           const targetLead = matchedLeads.find((l) => {
-            const p1 = (l.phone_number || '').replace(/\D/g, '');
-            const p2 = (l.whatsapp_number || '').replace(/\D/g, '');
-            return (p1 && (p1.endsWith(senderPhoneRaw) || senderPhoneRaw.endsWith(p1))) ||
-                   (p2 && (p2.endsWith(senderPhoneRaw) || senderPhoneRaw.endsWith(p2)));
+            return matchPhone(l.phone_number, senderPhoneRaw) || matchPhone(l.whatsapp_number, senderPhoneRaw);
           });
 
           if (!targetLead) {
@@ -518,7 +561,7 @@ async function startConnection(sessionId) {
             lead_id: targetLead.id,
             sender_type: 'lead',
             session_id: sessionId,
-            message_text: text || '📷 [Media Attachment]',
+            message_text: text,
             message_status: 'delivered',
             wa_message_id: msg.key.id || null,
           });
@@ -528,8 +571,31 @@ async function startConnection(sessionId) {
           } else {
             log('✅', `[Session ${sessionId}] Saved incoming lead message for "${targetLead.business_name}"`);
             await supabase.from('marketing_leads').update({
-              last_message_at: new Date().toISOString()
+              last_message_at: new Date().toISOString(),
+              whatsapp_session_id: sessionId
             }).eq('id', targetLead.id);
+
+            // Trigger Push Notification to assigned agent & admins
+            try {
+              const pushResp = await fetch(`${SUPABASE_URL}/functions/v1/send-fcm-notification`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
+                },
+                body: JSON.stringify({
+                  type: 'lead_reply_notification',
+                  leadId: targetLead.id,
+                  businessName: targetLead.business_name,
+                  messageText: text,
+                  agentId: targetLead.agent_id || targetLead.created_by || null
+                })
+              });
+              const pushResult = await pushResp.json();
+              log('🔔', `[Session ${sessionId}] Lead reply push notification result: ${JSON.stringify(pushResult)}`);
+            } catch (pushErr) {
+              log('⚠️', `Failed to trigger push notification for lead reply: ${pushErr.message}`);
+            }
           }
 
           if (targetLead.sela_ai_enabled) {
