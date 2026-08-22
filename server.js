@@ -613,6 +613,70 @@ const authMiddleware = (req, res, next) => {
 app.use(authMiddleware);
 
 // ─────────────────────────────────────────────
+// Session Health Validator & Periodic Auto-Cleanup Loop
+// Safe check: Only deletes sessions that are genuinely disconnected/unlinked on phone or missing credentials.
+// Preserves all active sockets and auto-reconnects idle credentialed sessions.
+// ─────────────────────────────────────────────
+async function validateAllDatabaseSessions() {
+  try {
+    const { data: dbSessions } = await supabase
+      .from('whatsapp_sessions')
+      .select('session_id, status, phone, parent_session_id');
+
+    if (!dbSessions || dbSessions.length === 0) return;
+
+    for (const dbSess of dbSessions) {
+      const id = dbSess.session_id;
+
+      if (dbSess.parent_session_id) {
+        const parentInMem = sessions[dbSess.parent_session_id];
+        if (parentInMem && parentInMem.connectionStatus === 'connected') {
+          continue;
+        }
+        const { data: parentDb } = await supabase
+          .from('whatsapp_sessions')
+          .select('status')
+          .eq('session_id', dbSess.parent_session_id)
+          .maybeSingle();
+
+        if (!parentDb || parentDb.status === 'disconnected') {
+          log('🧹', `Cleaning up child session ${id} with dead parent ${dbSess.parent_session_id}`);
+          await updateSessionStatus(id, { status: 'disconnected', phone: null });
+        }
+        continue;
+      }
+
+      const memSess = sessions[id];
+
+      if (memSess && memSess.connectionStatus === 'connected' && memSess.sock) {
+        continue;
+      }
+
+      if (memSess && (memSess.connectionStatus === 'connecting' || memSess.connectionStatus === 'qrcode')) {
+        continue;
+      }
+
+      const sessionAuthDir = path.join(AUTH_DIR, id);
+      const credsFile = path.join(sessionAuthDir, 'creds.json');
+      const hasAuthCreds = fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10;
+
+      if (hasAuthCreds) {
+        if (!memSess?.isConnecting) {
+          log('🔄', `[Session Validator] Idle credentials found for session ${id} — auto-reconnecting...`);
+          startConnection(id);
+        }
+      } else {
+        log('🗑️', `[Session Validator] Cleaning up dead/unlinked session ${id} from database`);
+        await updateSessionStatus(id, { status: 'disconnected', phone: null });
+        if (sessions[id]) delete sessions[id];
+      }
+    }
+  } catch (err) {
+    log('⚠️', `[Session Validator] Error validating DB sessions: ${err.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────
 // API Routes
 // ─────────────────────────────────────────────
 
@@ -624,36 +688,96 @@ app.get('/status', async (req, res) => {
   }
 
   let session = sessions[sessionId];
-  let effectiveStatus = session ? session.connectionStatus : 'disconnected';
-  let effectivePhone = session ? session.currentPhone : null;
-  let effectiveQr = session ? session.qrCode : null;
 
-  if (effectiveStatus !== 'connected') {
-    const { data: dbSess } = await supabase
-      .from('whatsapp_sessions')
-      .select('status, phone, parent_session_id, qr_code')
-      .eq('session_id', sessionId)
-      .maybeSingle();
+  if (session && session.connectionStatus === 'connected' && session.sock) {
+    return res.json({
+      success: true,
+      status: 'connected',
+      phone: session.currentPhone,
+      qr_code: null,
+      queue_length: session.queue.length,
+    });
+  }
 
-    if (dbSess) {
-      if (dbSess.parent_session_id && sessions[dbSess.parent_session_id]) {
-        const parent = sessions[dbSess.parent_session_id];
-        effectiveStatus = parent.connectionStatus;
-        effectivePhone = parent.currentPhone || dbSess.phone;
-      } else {
-        effectiveStatus = dbSess.status || effectiveStatus;
-        effectivePhone = dbSess.phone || effectivePhone;
-        effectiveQr = dbSess.qr_code || effectiveQr;
-      }
+  if (session && (session.connectionStatus === 'connecting' || session.connectionStatus === 'qrcode')) {
+    return res.json({
+      success: true,
+      status: session.connectionStatus,
+      phone: session.currentPhone,
+      qr_code: session.qrCode,
+      queue_length: session.queue.length,
+    });
+  }
+
+  const { data: dbSess } = await supabase
+    .from('whatsapp_sessions')
+    .select('status, phone, parent_session_id, qr_code')
+    .eq('session_id', sessionId)
+    .maybeSingle();
+
+  if (!dbSess) {
+    return res.json({
+      success: true,
+      status: 'disconnected',
+      phone: null,
+      qr_code: null,
+      queue_length: 0,
+    });
+  }
+
+  if (dbSess.parent_session_id && sessions[dbSess.parent_session_id]?.connectionStatus === 'connected') {
+    const parent = sessions[dbSess.parent_session_id];
+    return res.json({
+      success: true,
+      status: 'connected',
+      phone: parent.currentPhone || dbSess.phone,
+      qr_code: null,
+      queue_length: parent.queue.length,
+    });
+  }
+
+  const sessionAuthDir = path.join(AUTH_DIR, sessionId);
+  const credsFile = path.join(sessionAuthDir, 'creds.json');
+  const hasAuthCreds = fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10;
+
+  if (hasAuthCreds) {
+    startConnection(sessionId);
+    await delay(1500);
+    const recheckedSession = sessions[sessionId];
+    if (recheckedSession && recheckedSession.connectionStatus === 'connected') {
+      return res.json({
+        success: true,
+        status: 'connected',
+        phone: recheckedSession.currentPhone,
+        qr_code: null,
+        queue_length: recheckedSession.queue.length,
+      });
     }
   }
 
+  await updateSessionStatus(sessionId, { status: 'disconnected', phone: null });
+
   res.json({
     success: true,
-    status: effectiveStatus,
-    phone: effectivePhone,
-    qr_code: effectiveQr,
-    queue_length: session ? session.queue.length : 0,
+    status: 'disconnected',
+    phone: null,
+    qr_code: null,
+    queue_length: 0,
+  });
+});
+
+// GET /verify-sessions — Validate all sessions in DB and clean up dead ones
+app.get('/verify-sessions', async (req, res) => {
+  await validateAllDatabaseSessions();
+
+  const { data: activeDbSessions } = await supabase
+    .from('whatsapp_sessions')
+    .select('session_id, phone, status')
+    .eq('status', 'connected');
+
+  res.json({
+    success: true,
+    active_sessions: activeDbSessions || []
   });
 });
 
@@ -1269,4 +1393,8 @@ app.listen(PORT, async () => {
   if (subdirs.length === 0) {
     log('📱', 'No saved sessions found. Waiting for /connect calls to generate QR codes.');
   }
+
+  // Periodic automatic validation loop to clean up dead/unlinked sessions from database safely
+  setInterval(validateAllDatabaseSessions, 45000);
+  setTimeout(validateAllDatabaseSessions, 5000);
 });
