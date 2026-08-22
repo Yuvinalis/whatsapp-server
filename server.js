@@ -473,6 +473,87 @@ async function startConnection(sessionId) {
         }
       }
     });
+
+    // ── Incoming Messages Ingestion & Sela AI Auto-Reply ──
+    sock.ev.on('messages.upsert', async (mUpsert) => {
+      try {
+        if (!mUpsert || !mUpsert.messages || !mUpsert.messages.length) return;
+        for (const msg of mUpsert.messages) {
+          if (!msg.message || msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+
+          const remoteJid = msg.key.remoteJid || '';
+          const senderPhoneRaw = remoteJid.split('@')[0].split(':')[0].replace(/\D/g, '');
+          if (!senderPhoneRaw) continue;
+
+          const text = msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            msg.message.imageMessage?.caption ||
+            msg.message.videoMessage?.caption ||
+            msg.message.documentMessage?.caption ||
+            '';
+
+          if (!text.trim() && !msg.message.imageMessage && !msg.message.documentMessage) continue;
+
+          log('📩', `[Session ${sessionId}] Incoming message from ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
+
+          const { data: matchedLeads, error: leadErr } = await supabase
+            .from('marketing_leads')
+            .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled');
+
+          if (leadErr || !matchedLeads) continue;
+
+          const targetLead = matchedLeads.find((l) => {
+            const p1 = (l.phone_number || '').replace(/\D/g, '');
+            const p2 = (l.whatsapp_number || '').replace(/\D/g, '');
+            return (p1 && (p1.endsWith(senderPhoneRaw) || senderPhoneRaw.endsWith(p1))) ||
+                   (p2 && (p2.endsWith(senderPhoneRaw) || senderPhoneRaw.endsWith(p2)));
+          });
+
+          if (!targetLead) {
+            log('ℹ️', `[Session ${sessionId}] No matching marketing lead for phone ${senderPhoneRaw}`);
+            continue;
+          }
+
+          const { error: insErr } = await supabase.from('lead_chat_messages').insert({
+            lead_id: targetLead.id,
+            sender_type: 'lead',
+            session_id: sessionId,
+            message_text: text || '📷 [Media Attachment]',
+            message_status: 'delivered',
+            wa_message_id: msg.key.id || null,
+          });
+
+          if (insErr) {
+            log('❌', `Failed to insert lead chat message: ${insErr.message}`);
+          } else {
+            log('✅', `[Session ${sessionId}] Saved incoming lead message for "${targetLead.business_name}"`);
+            await supabase.from('marketing_leads').update({
+              last_message_at: new Date().toISOString()
+            }).eq('id', targetLead.id);
+          }
+
+          if (targetLead.sela_ai_enabled) {
+            log('🤖', `[Session ${sessionId}] Sela AI auto-reply triggered for "${targetLead.business_name}"`);
+            const aiReplyText = `Hello! Thanks for reaching out to ${targetLead.business_name}. Sela AI Assistant here: We are updating your store layout and catalog! Send us any questions or product details anytime.`;
+
+            await supabase.from('lead_chat_messages').insert({
+              lead_id: targetLead.id,
+              sender_type: 'system',
+              session_id: sessionId,
+              message_text: aiReplyText,
+              message_status: 'sent',
+            });
+
+            enqueueMessage(sessionId, {
+              phone: senderPhoneRaw,
+              message: aiReplyText
+            });
+          }
+        }
+      } catch (upsertErr) {
+        log('❌', `[Session ${sessionId}] Error in messages.upsert: ${upsertErr.message}`);
+      }
+    });
   } catch (err) {
     log('❌', `[Session ${sessionId}] Connection startup error: ${err.message}`);
     session.isConnecting = false;
