@@ -206,20 +206,6 @@ function enqueueMessage(sessionId, msgItem) {
 // ─────────────────────────────────────────────
 async function updateSessionStatus(sessionId, updates) {
   try {
-    if (updates.status === 'disconnected') {
-      const { error } = await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId);
-      if (error) throw error;
-      
-      // Also update any child sessions sharing this session
-      await supabase
-        .from('whatsapp_sessions')
-        .update({ status: 'disconnected', phone: null, updated_at: new Date().toISOString() })
-        .eq('parent_session_id', sessionId);
-
-      log('🗑️', `[Session ${sessionId}] Disconnected session deleted from database`);
-      return;
-    }
-
     const { error } = await supabase.from('whatsapp_sessions').upsert(
       {
         session_id: sessionId,
@@ -231,7 +217,7 @@ async function updateSessionStatus(sessionId, updates) {
     if (error) throw error;
 
     // Propagate status & phone to all child stores sharing this session
-    if (updates.status === 'connected' || updates.status === 'connecting') {
+    if (updates.status === 'connected' || updates.status === 'connecting' || updates.status === 'disconnected') {
       await supabase
         .from('whatsapp_sessions')
         .update({
@@ -295,7 +281,10 @@ async function startConnection(sessionId) {
     // Restore auth from Supabase if missing locally
     await restoreAuthFromSupabase(sessionId);
 
-    const sessionAuthDir = path.join(AUTH_DIR, sessionId);
+    let sessionAuthDir = path.join(AUTH_DIR, sessionId);
+    if (!fs.existsSync(path.join(sessionAuthDir, 'creds.json')) && fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
+      sessionAuthDir = AUTH_DIR;
+    }
     const { state, saveCreds } = await useMultiFileAuthState(sessionAuthDir);
 
     const sock = makeWASocket({
@@ -723,7 +712,9 @@ async function validateAllDatabaseSessions() {
       }
 
       const sessionAuthDir = path.join(AUTH_DIR, id);
-      const credsFile = path.join(sessionAuthDir, 'creds.json');
+      const credsFile = fs.existsSync(path.join(sessionAuthDir, 'creds.json'))
+        ? path.join(sessionAuthDir, 'creds.json')
+        : path.join(AUTH_DIR, 'creds.json');
       const hasAuthCreds = fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10;
 
       if (hasAuthCreds) {
@@ -732,7 +723,7 @@ async function validateAllDatabaseSessions() {
           startConnection(id);
         }
       } else {
-        log('🗑️', `[Session Validator] Cleaning up dead/unlinked session ${id} from database`);
+        log('⚠️', `[Session Validator] Marking idle session ${id} as disconnected in database`);
         await updateSessionStatus(id, { status: 'disconnected', phone: null });
         if (sessions[id]) delete sessions[id];
       }
@@ -1427,31 +1418,22 @@ app.listen(PORT, async () => {
 
 
 
-  // Scan and reconnect all saved sessions
+  // Scan and reconnect root credentials session if present
+  if (fs.existsSync(path.join(AUTH_DIR, 'creds.json')) && fs.statSync(path.join(AUTH_DIR, 'creds.json')).size > 10) {
+    log('🔄', 'Found active root WhatsApp auth session — auto-reconnecting default session...');
+    startConnection('default');
+  }
+
+  // Scan and reconnect all saved sub-sessions
   const subdirs = fs.readdirSync(AUTH_DIR).filter(file => {
     return fs.statSync(path.join(AUTH_DIR, file)).isDirectory();
   });
 
   for (const sessionId of subdirs) {
     const sessionAuthDir = path.join(AUTH_DIR, sessionId);
-
-    // Verify if this session is marked connected in Supabase DB as a primary session
-    const { data: dbSess } = await supabase
-      .from('whatsapp_sessions')
-      .select('status, parent_session_id')
-      .eq('session_id', sessionId)
-      .maybeSingle();
-
-    if (!dbSess || dbSess.status === 'disconnected' || dbSess.parent_session_id) {
-      log('🧹', `Cleaning up orphan/child local auth files for session ${sessionId}...`);
-      if (fs.existsSync(sessionAuthDir)) {
-        fs.rmSync(sessionAuthDir, { recursive: true, force: true });
-      }
-      if (sessions[sessionId]) {
-        delete sessions[sessionId];
-      }
-    } else if (fs.readdirSync(sessionAuthDir).length > 0) {
-      log('🔄', `Found valid active primary auth session for ${sessionId} — auto-reconnecting...`);
+    const credsFile = path.join(sessionAuthDir, 'creds.json');
+    if (fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10) {
+      log('🔄', `Found valid active auth session for ${sessionId} — auto-reconnecting...`);
       startConnection(sessionId);
     }
   }
