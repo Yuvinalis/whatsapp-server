@@ -1096,7 +1096,7 @@ app.post('/process-queue', async (req, res) => {
     let skipped = 0;
 
     for (const msg of messages) {
-      const storeSessionId = msg.store_id;
+      const storeSessionId = msg.session_id || msg.store_id;
       let session = storeSessionId ? sessions[storeSessionId] : null;
       let activeSessionId = storeSessionId;
 
@@ -1142,6 +1142,35 @@ app.post('/process-queue', async (req, res) => {
           if (match) {
             activeSessionId = match[0];
             session = match[1];
+          }
+        }
+      }
+
+      // ── Active session fallback matching if no exact session match was found ──
+      if (!session || session.connectionStatus !== 'connected' || !session.sock) {
+        const activeFallback = Object.entries(sessions).find(
+          ([, s]) => s.connectionStatus === 'connected' && s.sock
+        );
+        if (activeFallback) {
+          activeSessionId = activeFallback[0];
+          session = activeFallback[1];
+          log('🔀', `Fallback: routing msg ${msg.id} to active connected session ${activeSessionId}`);
+        } else {
+          const { data: anyConnSess } = await supabase
+            .from('whatsapp_sessions')
+            .select('session_id')
+            .eq('status', 'connected')
+            .limit(1)
+            .maybeSingle();
+
+          if (anyConnSess?.session_id) {
+            log('🔄', `Auto-triggering connection for active fallback session ${anyConnSess.session_id}...`);
+            startConnection(anyConnSess.session_id);
+            await delay(2000);
+            if (sessions[anyConnSess.session_id]?.connectionStatus === 'connected') {
+              activeSessionId = anyConnSess.session_id;
+              session = sessions[anyConnSess.session_id];
+            }
           }
         }
       }
