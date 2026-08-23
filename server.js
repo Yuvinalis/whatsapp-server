@@ -344,6 +344,25 @@ async function saveAuthToSupabase(sessionId) {
   }
 }
 
+let leadsCacheData = null;
+let leadsCacheTime = 0;
+
+async function getCachedLeads() {
+  const now = Date.now();
+  if (leadsCacheData && (now - leadsCacheTime < 15000)) {
+    return leadsCacheData;
+  }
+  const { data, error } = await supabase
+    .from('marketing_leads')
+    .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled, agent_id, created_by');
+
+  if (!error && data) {
+    leadsCacheData = data;
+    leadsCacheTime = now;
+  }
+  return leadsCacheData || [];
+}
+
 // Helper to process incoming, outgoing, or historic WhatsApp messages
 async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
   if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast') return;
@@ -375,11 +394,8 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     else text = '💬 [Message]';
   }
 
-  const { data: matchedLeads, error: leadErr } = await supabase
-    .from('marketing_leads')
-    .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled, agent_id, created_by');
-
-  if (leadErr || !matchedLeads) return;
+  const matchedLeads = await getCachedLeads();
+  if (!matchedLeads || !matchedLeads.length) return;
 
   const targetLead = matchedLeads.find((l) => {
     return matchPhone(l.phone_number, senderPhoneRaw) || matchPhone(l.whatsapp_number, senderPhoneRaw);
@@ -493,9 +509,17 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
 
   log('📩', `[Session ${sessionId}] Ingesting WhatsApp ${senderType} msg with ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
 
-  const msgTimestamp = msg.messageTimestamp 
-    ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
-    : new Date().toISOString();
+  let tsSec = Date.now() / 1000;
+  if (typeof msg.messageTimestamp === 'number') {
+    tsSec = msg.messageTimestamp;
+  } else if (msg.messageTimestamp && typeof msg.messageTimestamp.toNumber === 'function') {
+    tsSec = msg.messageTimestamp.toNumber();
+  } else if (msg.messageTimestamp && typeof msg.messageTimestamp === 'object' && msg.messageTimestamp.low) {
+    tsSec = msg.messageTimestamp.low;
+  } else if (typeof msg.messageTimestamp === 'string') {
+    tsSec = parseInt(msg.messageTimestamp, 10) || (Date.now() / 1000);
+  }
+  const msgTimestamp = new Date(tsSec * 1000).toISOString();
 
   if (pendingMatchId) {
     const updatePayload = {
