@@ -611,7 +611,8 @@ async function startConnection(sessionId) {
       printQRInTerminal: false,
       browser: Browsers.ubuntu('Chrome'),
       logger: pino({ level: 'silent' }),
-      syncFullHistory: false, // Prevents historic chat sync from blocking Node event loop & timing out connection
+      syncFullHistory: true,
+      shouldSyncHistoryMessage: () => true,
       generateHighQualityLinkPreview: false,
       markOnlineOnConnect: true,
       connectTimeoutMs: 60000,
@@ -832,9 +833,15 @@ async function startConnection(sessionId) {
       try {
         if (!histMessages || !histMessages.length) return;
         log('📜', `[Session ${sessionId}] Received ${histMessages.length} historic chat messages from WhatsApp history sync`);
-        for (const msg of histMessages) {
-          await processIncomingOrHistoricMessage(sessionId, sock, msg);
+        for (let i = 0; i < histMessages.length; i += 20) {
+          const chunk = histMessages.slice(i, i + 20);
+          await Promise.all(
+            chunk.map(msg => processIncomingOrHistoricMessage(sessionId, sock, msg).catch(e => {
+              log('⚠️', `[Session ${sessionId}] Historic msg process error: ${e.message}`);
+            }))
+          );
         }
+        log('✅', `[Session ${sessionId}] Finished ingesting ${histMessages.length} historic chat messages`);
       } catch (hErr) {
         log('❌', `[Session ${sessionId}] Error in messaging-history.set: ${hErr.message}`);
       }
@@ -1485,11 +1492,31 @@ app.post('/sync-lead-chat', async (req, res) => {
         const leadPhone = targetLead.whatsapp_number || targetLead.phone_number;
         const jid = formatJid(leadPhone);
 
-        // On-demand history sync: request chat history from WhatsApp via Baileys fetchMessageHistory if supported
+        // On-demand history sync: request chat history from WhatsApp via Baileys fetchMessageHistory
         if (typeof sess.sock.fetchMessageHistory === 'function') {
           try {
-            log('📜', `[Sync] Requesting chat history fetch for ${jid}...`);
-            await sess.sock.fetchMessageHistory(100, undefined, undefined);
+            // Find oldest existing message for this lead in DB to anchor history fetch
+            const { data: oldestMsg } = await supabase
+              .from('lead_chat_messages')
+              .select('wa_message_id, created_at, sender_type')
+              .eq('lead_id', targetLead.id)
+              .not('wa_message_id', 'is', null)
+              .order('created_at', { ascending: true })
+              .limit(1)
+              .maybeSingle();
+
+            const oldestMsgKey = {
+              remoteJid: jid,
+              fromMe: oldestMsg ? oldestMsg.sender_type !== 'lead' : false,
+              id: oldestMsg?.wa_message_id || `3EB0${Math.random().toString(36).substring(2, 10).toUpperCase()}`
+            };
+
+            const oldestTimestamp = oldestMsg?.created_at
+              ? new Date(oldestMsg.created_at).getTime()
+              : Date.now();
+
+            log('📜', `[Sync] Requesting WhatsApp on-demand chat history (100 msgs) for ${jid}...`);
+            await sess.sock.fetchMessageHistory(100, oldestMsgKey, oldestTimestamp);
           } catch (fErr) {
             log('⚠️', `[Sync] History fetch error for ${jid}: ${fErr.message}`);
           }
