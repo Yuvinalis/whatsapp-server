@@ -1514,7 +1514,7 @@ app.post('/sync-lead-chat', async (req, res) => {
             const oldestMsgKey = {
               remoteJid: jid,
               fromMe: oldestMsg ? oldestMsg.sender_type !== 'lead' : false,
-              id: oldestMsg?.wa_message_id || `3EB0${Math.random().toString(36).substring(2, 10).toUpperCase()}`
+              id: oldestMsg?.wa_message_id || ''
             };
 
             const oldestTimestamp = oldestMsg?.created_at
