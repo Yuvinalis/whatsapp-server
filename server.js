@@ -1492,10 +1492,16 @@ app.post('/sync-lead-chat', async (req, res) => {
         const leadPhone = targetLead.whatsapp_number || targetLead.phone_number;
         const jid = formatJid(leadPhone);
 
+        // If clear_local is requested, purge existing local messages for this lead before syncing fresh from WhatsApp
+        if (req.body.clear_local) {
+          log('🧹', `[Sync] Clearing local messages for lead ${targetLead.id} before fresh WhatsApp sync`);
+          await supabase.from('lead_chat_messages').delete().eq('lead_id', targetLead.id);
+        }
+
         // On-demand history sync: request chat history from WhatsApp via Baileys fetchMessageHistory
         if (typeof sess.sock.fetchMessageHistory === 'function') {
           try {
-            // Find oldest existing message for this lead in DB to anchor history fetch
+            // Find oldest existing message with a valid wa_message_id for this lead in DB to anchor history fetch
             const { data: oldestMsg } = await supabase
               .from('lead_chat_messages')
               .select('wa_message_id, created_at, sender_type')
