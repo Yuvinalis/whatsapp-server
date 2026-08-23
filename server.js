@@ -254,6 +254,163 @@ async function saveAuthToSupabase(sessionId) {
   // Credentials are store locally in auth_sessions folder
 }
 
+// Helper to process incoming, outgoing, or historic WhatsApp messages
+async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
+  if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast') return;
+
+  const senderPhoneRaw = extractPhoneFromMsg(msg);
+  if (!senderPhoneRaw) return;
+
+  const isFromMe = !!msg.key.fromMe;
+  const senderType = isFromMe ? 'agent' : 'lead';
+
+  let text = msg.message.conversation ||
+    msg.message.extendedTextMessage?.text ||
+    msg.message.imageMessage?.caption ||
+    msg.message.videoMessage?.caption ||
+    msg.message.documentMessage?.caption ||
+    msg.message.buttonsResponseMessage?.selectedDisplayText ||
+    msg.message.listResponseMessage?.title ||
+    msg.message.templateButtonReplyMessage?.selectedDisplayText ||
+    '';
+
+  if (!text.trim()) {
+    if (msg.message.imageMessage) text = '📷 [Image Attachment]';
+    else if (msg.message.videoMessage) text = '🎥 [Video Attachment]';
+    else if (msg.message.audioMessage) text = '🎵 [Audio Message]';
+    else if (msg.message.documentMessage) text = '📄 [Document Attachment]';
+    else if (msg.message.stickerMessage) text = '🎨 [Sticker]';
+    else if (msg.message.contactMessage || msg.message.contactsArrayMessage) text = '🎴 [Contact Card]';
+    else if (msg.message.locationMessage || msg.message.liveLocationMessage) text = '📍 [Location Pin]';
+    else text = '💬 [Message]';
+  }
+
+  const { data: matchedLeads, error: leadErr } = await supabase
+    .from('marketing_leads')
+    .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled, agent_id, created_by');
+
+  if (leadErr || !matchedLeads) return;
+
+  const targetLead = matchedLeads.find((l) => {
+    return matchPhone(l.phone_number, senderPhoneRaw) || matchPhone(l.whatsapp_number, senderPhoneRaw);
+  });
+
+  if (!targetLead) return;
+
+  // Send Delivery Receipt (2 Gray Ticks on lead's WhatsApp) for incoming lead messages
+  if (!isFromMe && msg.key.remoteJid && msg.key.id && sock) {
+    try {
+      await sock.sendReceipt(msg.key.remoteJid, msg.key.participant, [msg.key.id], 'delivery');
+      log('✔️✔️', `[Session ${sessionId}] Delivery receipt (2 ticks) sent to ${msg.key.remoteJid} for msg ${msg.key.id}`);
+    } catch (e) {
+      log('⚠️', `[Session ${sessionId}] Delivery receipt error: ${e.message}`);
+    }
+  }
+
+  // Check if an unconfirmed optimistic message exists for this lead
+  let pendingMatchId = null;
+  if (isFromMe) {
+    const { data: pendingMsg } = await supabase
+      .from('lead_chat_messages')
+      .select('id')
+      .eq('lead_id', targetLead.id)
+      .eq('sender_type', 'agent')
+      .is('wa_message_id', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (pendingMsg) pendingMatchId = pendingMsg.id;
+  }
+
+  if (msg.key.id) {
+    const { data: existing } = await supabase
+      .from('lead_chat_messages')
+      .select('id')
+      .eq('lead_id', targetLead.id)
+      .eq('wa_message_id', msg.key.id)
+      .maybeSingle();
+
+    if (existing) return;
+  }
+
+  log('📩', `[Session ${sessionId}] Ingesting WhatsApp ${senderType} msg with ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
+
+  const msgTimestamp = msg.messageTimestamp 
+    ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
+    : new Date().toISOString();
+
+  if (pendingMatchId) {
+    await supabase
+      .from('lead_chat_messages')
+      .update({
+        wa_message_id: msg.key.id || null,
+        message_status: 'sent',
+        created_at: msgTimestamp
+      })
+      .eq('id', pendingMatchId);
+    log('✅', `[Session ${sessionId}] Linked optimistic message ${pendingMatchId} with wa_message_id ${msg.key.id}`);
+  } else {
+    const { error: insErr } = await supabase.from('lead_chat_messages').insert({
+      lead_id: targetLead.id,
+      sender_type: senderType,
+      session_id: sessionId,
+      message_text: text,
+      message_status: isFromMe ? 'sent' : 'delivered',
+      wa_message_id: msg.key.id || null,
+      created_at: msgTimestamp
+    });
+
+    if (insErr) {
+      log('❌', `Failed to insert lead chat message: ${insErr.message}`);
+    }
+  }
+
+  await supabase.from('marketing_leads').update({
+    last_message_at: msgTimestamp,
+    whatsapp_session_id: sessionId
+  }).eq('id', targetLead.id);
+
+  // Push Notification for incoming lead messages
+  if (!isFromMe) {
+    try {
+      await fetch(`${SUPABASE_URL}/functions/v1/send-fcm-notification`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
+        },
+        body: JSON.stringify({
+          type: 'lead_reply_notification',
+          leadId: targetLead.id,
+          businessName: targetLead.business_name,
+          messageText: text,
+          agentId: targetLead.agent_id || targetLead.created_by || null
+        })
+      });
+    } catch (pushErr) {}
+  }
+
+  // Sela AI Auto Reply
+  if (!isFromMe && targetLead.sela_ai_enabled) {
+    log('🤖', `[Session ${sessionId}] Sela AI auto-reply triggered for "${targetLead.business_name}"`);
+    const aiReplyText = `Hello! Thanks for reaching out to ${targetLead.business_name}. Sela AI Assistant here: We are updating your store layout and catalog! Send us any questions or product details anytime.`;
+
+    await supabase.from('lead_chat_messages').insert({
+      lead_id: targetLead.id,
+      sender_type: 'system',
+      session_id: sessionId,
+      message_text: aiReplyText,
+      message_status: 'sent',
+    });
+
+    enqueueMessage(sessionId, {
+      phone: senderPhoneRaw,
+      message: aiReplyText
+    });
+  }
+}
+
 // ─────────────────────────────────────────────
 // Baileys WhatsApp Connection
 // ─────────────────────────────────────────────
@@ -498,164 +655,27 @@ async function startConnection(sessionId) {
       }
     });
 
-    // ── WhatsApp Messages Ingestion (Incoming & Outgoing Sync) & Sela AI Auto-Reply ──
+    // ── WhatsApp Real-time & Historic Messages Ingestion ──
     sock.ev.on('messages.upsert', async (mUpsert) => {
       try {
         if (!mUpsert || !mUpsert.messages || !mUpsert.messages.length) return;
         for (const msg of mUpsert.messages) {
-          if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
-
-          const senderPhoneRaw = extractPhoneFromMsg(msg);
-          if (!senderPhoneRaw) continue;
-
-          const isFromMe = !!msg.key.fromMe;
-          const senderType = isFromMe ? 'agent' : 'lead';
-
-          let text = msg.message.conversation ||
-            msg.message.extendedTextMessage?.text ||
-            msg.message.imageMessage?.caption ||
-            msg.message.videoMessage?.caption ||
-            msg.message.documentMessage?.caption ||
-            msg.message.buttonsResponseMessage?.selectedDisplayText ||
-            msg.message.listResponseMessage?.title ||
-            msg.message.templateButtonReplyMessage?.selectedDisplayText ||
-            '';
-
-          if (!text.trim()) {
-            if (msg.message.imageMessage) text = '📷 [Image Attachment]';
-            else if (msg.message.videoMessage) text = '🎥 [Video Attachment]';
-            else if (msg.message.audioMessage) text = '🎵 [Audio Message]';
-            else if (msg.message.documentMessage) text = '📄 [Document Attachment]';
-            else if (msg.message.stickerMessage) text = '🎨 [Sticker]';
-            else if (msg.message.contactMessage || msg.message.contactsArrayMessage) text = '🎴 [Contact Card]';
-            else if (msg.message.locationMessage || msg.message.liveLocationMessage) text = '📍 [Location Pin]';
-            else text = '💬 [Message]';
-          }
-
-          const { data: matchedLeads, error: leadErr } = await supabase
-            .from('marketing_leads')
-            .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled, agent_id, created_by');
-
-          if (leadErr || !matchedLeads) continue;
-
-          const targetLead = matchedLeads.find((l) => {
-            return matchPhone(l.phone_number, senderPhoneRaw) || matchPhone(l.whatsapp_number, senderPhoneRaw);
-          });
-
-          if (!targetLead) continue;
-
-          // Check if an unconfirmed optimistic message exists for this lead
-          let pendingMatchId = null;
-          if (isFromMe) {
-            const { data: pendingMsg } = await supabase
-              .from('lead_chat_messages')
-              .select('id')
-              .eq('lead_id', targetLead.id)
-              .eq('sender_type', 'agent')
-              .is('wa_message_id', null)
-              .order('created_at', { ascending: false })
-              .limit(1)
-              .maybeSingle();
-
-            if (pendingMsg) pendingMatchId = pendingMsg.id;
-          }
-
-          if (msg.key.id) {
-            const { data: existing } = await supabase
-              .from('lead_chat_messages')
-              .select('id')
-              .eq('lead_id', targetLead.id)
-              .eq('wa_message_id', msg.key.id)
-              .maybeSingle();
-
-            if (existing) {
-              log('ℹ️', `[Session ${sessionId}] Message ${msg.key.id} already synced, skipping duplicate.`);
-              continue;
-            }
-          }
-
-          log('📩', `[Session ${sessionId}] Ingesting WhatsApp ${senderType} msg with ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
-
-          const msgTimestamp = msg.messageTimestamp 
-            ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
-            : new Date().toISOString();
-
-          if (pendingMatchId) {
-            await supabase
-              .from('lead_chat_messages')
-              .update({
-                wa_message_id: msg.key.id || null,
-                message_status: 'sent',
-                created_at: msgTimestamp
-              })
-              .eq('id', pendingMatchId);
-            log('✅', `[Session ${sessionId}] Linked optimistic message ${pendingMatchId} with wa_message_id ${msg.key.id}`);
-          } else {
-            const { error: insErr } = await supabase.from('lead_chat_messages').insert({
-              lead_id: targetLead.id,
-              sender_type: senderType,
-              session_id: sessionId,
-              message_text: text,
-              message_status: isFromMe ? 'sent' : 'delivered',
-              wa_message_id: msg.key.id || null,
-              created_at: msgTimestamp
-            });
-
-            if (insErr) {
-              log('❌', `Failed to insert lead chat message: ${insErr.message}`);
-            }
-          }
-
-          await supabase.from('marketing_leads').update({
-            last_message_at: msgTimestamp,
-            whatsapp_session_id: sessionId
-          }).eq('id', targetLead.id);
-
-            // Trigger Push Notification ONLY for incoming lead messages
-            if (!isFromMe) {
-              try {
-                const pushResp = await fetch(`${SUPABASE_URL}/functions/v1/send-fcm-notification`, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
-                  },
-                  body: JSON.stringify({
-                    type: 'lead_reply_notification',
-                    leadId: targetLead.id,
-                    businessName: targetLead.business_name,
-                    messageText: text,
-                    agentId: targetLead.agent_id || targetLead.created_by || null
-                  })
-                });
-                const pushResult = await pushResp.json();
-                log('🔔', `[Session ${sessionId}] Lead reply push notification result: ${JSON.stringify(pushResult)}`);
-              } catch (pushErr) {
-                log('⚠️', `Failed to trigger push notification for lead reply: ${pushErr.message}`);
-              }
-            }
-          }
-
-          if (!isFromMe && targetLead.sela_ai_enabled) {
-            log('🤖', `[Session ${sessionId}] Sela AI auto-reply triggered for "${targetLead.business_name}"`);
-            const aiReplyText = `Hello! Thanks for reaching out to ${targetLead.business_name}. Sela AI Assistant here: We are updating your store layout and catalog! Send us any questions or product details anytime.`;
-
-            await supabase.from('lead_chat_messages').insert({
-              lead_id: targetLead.id,
-              sender_type: 'system',
-              session_id: sessionId,
-              message_text: aiReplyText,
-              message_status: 'sent',
-            });
-
-            enqueueMessage(sessionId, {
-              phone: senderPhoneRaw,
-              message: aiReplyText
-            });
-          }
+          await processIncomingOrHistoricMessage(sessionId, sock, msg);
         }
       } catch (upsertErr) {
         log('❌', `[Session ${sessionId}] Error in messages.upsert: ${upsertErr.message}`);
+      }
+    });
+
+    sock.ev.on('messaging-history.set', async ({ messages: histMessages }) => {
+      try {
+        if (!histMessages || !histMessages.length) return;
+        log('📜', `[Session ${sessionId}] Received ${histMessages.length} historic chat messages from WhatsApp history sync`);
+        for (const msg of histMessages) {
+          await processIncomingOrHistoricMessage(sessionId, sock, msg);
+        }
+      } catch (hErr) {
+        log('❌', `[Session ${sessionId}] Error in messaging-history.set: ${hErr.message}`);
       }
     });
   } catch (err) {
@@ -1293,6 +1313,38 @@ app.post('/sync-lead-chat', async (req, res) => {
 
     if (!targetLead) {
       return res.status(404).json({ success: false, error: 'Lead not found for phone/id' });
+    }
+
+    // Send Read Receipts (Blue Ticks) to WhatsApp for this lead
+    let targetSessId = session_id;
+    let sess = targetSessId ? sessions[targetSessId] : null;
+    if (!sess || sess.connectionStatus !== 'connected') {
+      const active = Object.entries(sessions).find(([, s]) => s.connectionStatus === 'connected' && s.sock);
+      if (active) sess = active[1];
+    }
+
+    if (sess && sess.sock && targetLead) {
+      try {
+        const leadPhone = targetLead.whatsapp_number || targetLead.phone_number;
+        const jid = formatJid(leadPhone);
+        const { data: leadMsgs } = await supabase
+          .from('lead_chat_messages')
+          .select('wa_message_id')
+          .eq('lead_id', targetLead.id)
+          .eq('sender_type', 'lead')
+          .not('wa_message_id', 'is', null);
+
+        if (leadMsgs && leadMsgs.length > 0) {
+          const keysToRead = leadMsgs.map(m => ({ remoteJid: jid, id: m.wa_message_id, fromMe: false }));
+          await sess.sock.readMessages(keysToRead);
+          for (const m of leadMsgs) {
+            await sess.sock.sendReceipt(jid, undefined, [m.wa_message_id], 'read');
+          }
+          log('🔵🔵', `[Sync] Sent Read Receipt (Blue Ticks) for ${leadMsgs.length} message(s) to ${jid}`);
+        }
+      } catch (rErr) {
+        log('⚠️', `Read receipt sync warning: ${rErr.message}`);
+      }
     }
 
     const { count } = await supabase
