@@ -369,8 +369,24 @@ function unwrapMessage(m) {
   if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
   if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
   if (m.viewOnceMessageV2Extension?.message) return unwrapMessage(m.viewOnceMessageV2Extension.message);
+  if (m.viewOnceMessageV1?.message) return unwrapMessage(m.viewOnceMessageV1.message);
   if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
+  if (m.botInvokeMessage?.message) return unwrapMessage(m.botInvokeMessage.message);
+  if (m.groupMentionedMessage?.message) return unwrapMessage(m.groupMentionedMessage.message);
   return m;
+}
+
+function isViewOnceMessage(msg) {
+  if (!msg || !msg.message) return false;
+  const raw = msg.message;
+  if (raw.viewOnceMessage || raw.viewOnceMessageV2 || raw.viewOnceMessageV2Extension || raw.viewOnceMessageV1) {
+    return true;
+  }
+  const unwrapped = unwrapMessage(raw);
+  if (unwrapped?.imageMessage?.viewOnce || unwrapped?.videoMessage?.viewOnce || unwrapped?.audioMessage?.viewOnce) {
+    return true;
+  }
+  return false;
 }
 
 // Helper to process incoming, outgoing, or historic WhatsApp messages
@@ -385,6 +401,7 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
 
   const isFromMe = !!msg.key.fromMe;
   const senderType = isFromMe ? 'agent' : 'lead';
+  const isViewOnce = isViewOnceMessage(msg);
 
   let text = messageContent.conversation ||
     messageContent.extendedTextMessage?.text ||
@@ -400,15 +417,17 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     '';
 
   if (!text.trim()) {
-    if (messageContent.imageMessage) text = '📷 [Image Attachment]';
-    else if (messageContent.videoMessage) text = '🎥 [Video Attachment]';
-    else if (messageContent.audioMessage) text = '🎵 [Audio Message]';
+    if (messageContent.imageMessage) text = isViewOnce ? '👁️ [View Once Image]' : '📷 [Image Attachment]';
+    else if (messageContent.videoMessage) text = isViewOnce ? '👁️ [View Once Video]' : '🎥 [Video Attachment]';
+    else if (messageContent.audioMessage) text = isViewOnce ? '👁️ [View Once Audio]' : '🎵 [Audio Message]';
     else if (messageContent.documentMessage) text = '📄 [Document Attachment]';
     else if (messageContent.stickerMessage) text = '🎨 [Sticker]';
     else if (messageContent.contactMessage || messageContent.contactsArrayMessage) text = '🎴 [Contact Card]';
     else if (messageContent.locationMessage || messageContent.liveLocationMessage) text = '📍 [Location Pin]';
     else if (messageContent.reactionMessage) text = `👍 ${messageContent.reactionMessage.text || 'Reaction'}`;
     else text = '💬 [Message]';
+  } else if (isViewOnce && !text.includes('View Once') && !text.includes('👁️')) {
+    text = `👁️ [View Once] ${text}`;
   }
 
   const matchedLeads = await getCachedLeads();
@@ -476,12 +495,35 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
 
   if (isMediaMsg && typeof downloadMediaMessage === 'function') {
     try {
-      const buffer = await downloadMediaMessage(
-        msg,
-        'buffer',
-        {},
-        { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
-      );
+      let buffer = null;
+
+      // Construct synthetic download object with unwrapped message so Baileys can extract imageMessage/videoMessage directly
+      const downloadMsg = {
+        key: msg.key,
+        message: messageContent,
+        messageTimestamp: msg.messageTimestamp
+      };
+
+      try {
+        buffer = await downloadMediaMessage(
+          downloadMsg,
+          'buffer',
+          {},
+          { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
+        );
+      } catch (e1) {
+        log('⚠️', `[Session ${sessionId}] Primary downloadMediaMessage error: ${e1.message}. Retrying with original msg...`);
+        try {
+          buffer = await downloadMediaMessage(
+            msg,
+            'buffer',
+            {},
+            { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
+          );
+        } catch (e2) {
+          log('⚠️', `[Session ${sessionId}] Fallback downloadMediaMessage error: ${e2.message}`);
+        }
+      }
 
       if (buffer && buffer.length > 0) {
         let ext = 'bin';
