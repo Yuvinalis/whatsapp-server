@@ -449,40 +449,6 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     }
   }
 
-  // Deduplication check: if wa_message_id already exists in lead_chat_messages for this lead, skip
-  if (msg.key.id) {
-    const { data: existing } = await supabase
-      .from('lead_chat_messages')
-      .select('id')
-      .eq('lead_id', targetLead.id)
-      .eq('wa_message_id', msg.key.id)
-      .maybeSingle();
-
-    if (existing) return;
-  }
-
-  // Optimistic message matching for outgoing agent/admin messages within a 60-second window
-  let pendingMatchId = null;
-  if (isFromMe) {
-    const windowStart = new Date(Date.now() - 60000).toISOString();
-    const { data: pendingCandidates } = await supabase
-      .from('lead_chat_messages')
-      .select('id, message_text')
-      .eq('lead_id', targetLead.id)
-      .in('sender_type', ['agent', 'admin'])
-      .is('wa_message_id', null)
-      .gte('created_at', windowStart)
-      .order('created_at', { ascending: false });
-
-    if (pendingCandidates && pendingCandidates.length > 0) {
-      const matchTextClean = text.trim();
-      const matched = pendingCandidates.find(
-        (c) => c.message_text.trim() === matchTextClean || (matchTextClean && matchTextClean.includes(c.message_text.trim()))
-      );
-      pendingMatchId = matched ? matched.id : pendingCandidates[0].id;
-    }
-  }
-
   // Process & Download Media / Attachments (Images, Audio, Video, Documents, Stickers)
   let mediaUrl = null;
   const isMediaMsg = !!(
@@ -563,6 +529,37 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
       }
     } catch (mediaErr) {
       log('⚠️', `[Session ${sessionId}] Baileys downloadMediaMessage error: ${mediaErr.message}`);
+    }
+  }
+
+  // Deduplication check: if wa_message_id already exists in lead_chat_messages for this lead, update if needed then skip
+  if (msg.key.id) {
+    const { data: existing } = await supabase
+      .from('lead_chat_messages')
+      .select('id, message_text, media_url')
+      .eq('lead_id', targetLead.id)
+      .eq('wa_message_id', msg.key.id)
+      .maybeSingle();
+
+    if (existing) {
+      const updates = {};
+      if (isViewOnce && !existing.message_text?.includes('View Once') && !existing.message_text?.includes('👁️')) {
+        updates.message_text = existing.message_text.replace('📷 [Image Attachment]', '👁️ [View Once Image]')
+                                                   .replace('🎥 [Video Attachment]', '👁️ [View Once Video]')
+                                                   .replace('🎵 [Audio Message]', '👁️ [View Once Audio]');
+        if (!updates.message_text.includes('👁️')) {
+          updates.message_text = `👁️ [View Once] ${existing.message_text}`;
+        }
+      }
+      if (!existing.media_url && mediaUrl) {
+        updates.media_url = mediaUrl;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await supabase.from('lead_chat_messages').update(updates).eq('id', existing.id);
+        log('🔄', `[Session ${sessionId}] Backfilled view-once/media info for existing message ${existing.id}`);
+      }
+      return;
     }
   }
 
