@@ -1,5 +1,5 @@
 import express from 'express';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import { createClient } from '@supabase/supabase-js';
 import pino from 'pino';
@@ -397,22 +397,7 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     }
   }
 
-  // Check if an unconfirmed optimistic message exists for this lead
-  let pendingMatchId = null;
-  if (isFromMe) {
-    const { data: pendingMsg } = await supabase
-      .from('lead_chat_messages')
-      .select('id')
-      .eq('lead_id', targetLead.id)
-      .eq('sender_type', 'agent')
-      .is('wa_message_id', null)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (pendingMsg) pendingMatchId = pendingMsg.id;
-  }
-
+  // Deduplication check: if wa_message_id already exists in lead_chat_messages for this lead, skip
   if (msg.key.id) {
     const { data: existing } = await supabase
       .from('lead_chat_messages')
@@ -424,6 +409,88 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     if (existing) return;
   }
 
+  // Optimistic message matching for outgoing agent/admin messages within a 60-second window
+  let pendingMatchId = null;
+  if (isFromMe) {
+    const windowStart = new Date(Date.now() - 60000).toISOString();
+    const { data: pendingCandidates } = await supabase
+      .from('lead_chat_messages')
+      .select('id, message_text')
+      .eq('lead_id', targetLead.id)
+      .in('sender_type', ['agent', 'admin'])
+      .is('wa_message_id', null)
+      .gte('created_at', windowStart)
+      .order('created_at', { ascending: false });
+
+    if (pendingCandidates && pendingCandidates.length > 0) {
+      const matchTextClean = text.trim();
+      const matched = pendingCandidates.find(
+        (c) => c.message_text.trim() === matchTextClean || (matchTextClean && matchTextClean.includes(c.message_text.trim()))
+      );
+      pendingMatchId = matched ? matched.id : pendingCandidates[0].id;
+    }
+  }
+
+  // Process & Download Media / Attachments (Images, Audio, Video, Documents, Stickers)
+  let mediaUrl = null;
+  const isMediaMsg = !!(
+    msg.message?.imageMessage ||
+    msg.message?.videoMessage ||
+    msg.message?.audioMessage ||
+    msg.message?.documentMessage ||
+    msg.message?.stickerMessage
+  );
+
+  if (isMediaMsg && typeof downloadMediaMessage === 'function') {
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
+      );
+
+      if (buffer && buffer.length > 0) {
+        let ext = 'bin';
+        let mimeType = 'application/octet-stream';
+        if (msg.message.imageMessage) {
+          ext = 'jpg';
+          mimeType = msg.message.imageMessage.mimetype || 'image/jpeg';
+        } else if (msg.message.audioMessage) {
+          ext = 'mp3';
+          mimeType = msg.message.audioMessage.mimetype || 'audio/ogg';
+        } else if (msg.message.videoMessage) {
+          ext = 'mp4';
+          mimeType = msg.message.videoMessage.mimetype || 'video/mp4';
+        } else if (msg.message.stickerMessage) {
+          ext = 'webp';
+          mimeType = 'image/webp';
+        } else if (msg.message.documentMessage) {
+          mimeType = msg.message.documentMessage.mimetype || 'application/pdf';
+          const docName = msg.message.documentMessage.fileName || 'document.pdf';
+          ext = docName.includes('.') ? docName.split('.').pop() : 'pdf';
+        }
+
+        const safeKeyId = msg.key.id ? msg.key.id.replace(/[^a-zA-Z0-9_-]/g, '') : Math.random().toString(36).substring(2);
+        const storagePath = `whatsapp-media/${targetLead.id}/${Date.now()}_${safeKeyId}.${ext}`;
+        
+        const { error: uploadErr } = await supabase.storage
+          .from('media')
+          .upload(storagePath, buffer, { contentType: mimeType, upsert: true });
+
+        if (!uploadErr) {
+          const { data: publicData } = supabase.storage.from('media').getPublicUrl(storagePath);
+          mediaUrl = publicData?.publicUrl || null;
+          log('📎', `[Session ${sessionId}] Downloaded media and stored at ${mediaUrl}`);
+        } else {
+          log('⚠️', `[Session ${sessionId}] Supabase media upload error: ${uploadErr.message}`);
+        }
+      }
+    } catch (mediaErr) {
+      log('⚠️', `[Session ${sessionId}] Baileys downloadMediaMessage error: ${mediaErr.message}`);
+    }
+  }
+
   log('📩', `[Session ${sessionId}] Ingesting WhatsApp ${senderType} msg with ${senderPhoneRaw}: "${text.substring(0, 50)}"`);
 
   const msgTimestamp = msg.messageTimestamp 
@@ -431,13 +498,16 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     : new Date().toISOString();
 
   if (pendingMatchId) {
+    const updatePayload = {
+      wa_message_id: msg.key.id || null,
+      message_status: 'sent',
+      created_at: msgTimestamp
+    };
+    if (mediaUrl) updatePayload.media_url = mediaUrl;
+
     await supabase
       .from('lead_chat_messages')
-      .update({
-        wa_message_id: msg.key.id || null,
-        message_status: 'sent',
-        created_at: msgTimestamp
-      })
+      .update(updatePayload)
       .eq('id', pendingMatchId);
     log('✅', `[Session ${sessionId}] Linked optimistic message ${pendingMatchId} with wa_message_id ${msg.key.id}`);
   } else {
@@ -446,6 +516,7 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
       sender_type: senderType,
       session_id: sessionId,
       message_text: text,
+      media_url: mediaUrl || null,
       message_status: isFromMe ? 'sent' : 'delivered',
       wa_message_id: msg.key.id || null,
       created_at: msgTimestamp
@@ -1413,6 +1484,17 @@ app.post('/sync-lead-chat', async (req, res) => {
       try {
         const leadPhone = targetLead.whatsapp_number || targetLead.phone_number;
         const jid = formatJid(leadPhone);
+
+        // On-demand history sync: request chat history from WhatsApp via Baileys fetchMessageHistory if supported
+        if (typeof sess.sock.fetchMessageHistory === 'function') {
+          try {
+            log('📜', `[Sync] Requesting chat history fetch for ${jid}...`);
+            await sess.sock.fetchMessageHistory(100, undefined, undefined);
+          } catch (fErr) {
+            log('⚠️', `[Sync] History fetch error for ${jid}: ${fErr.message}`);
+          }
+        }
+
         const { data: leadMsgs } = await supabase
           .from('lead_chat_messages')
           .select('wa_message_id')
