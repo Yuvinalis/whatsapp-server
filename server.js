@@ -57,7 +57,53 @@ const formatJid = (phone) => {
   return `${clean}@s.whatsapp.net`;
 };
 
-const extractPhoneFromMsg = (msg) => {
+const resolvePhoneFromLid = (lid, sessionId) => {
+  if (!lid) return null;
+  const cleanLid = String(lid).split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (!cleanLid) return null;
+
+  const targetFile = `lid-mapping-${cleanLid}_reverse.json`;
+
+  const possibleDirs = [
+    path.join(AUTH_DIR, sessionId || ''),
+    path.join(AUTH_DIR, 'ff5318b9-b744-49a4-a349-3e727ee0077f'),
+    AUTH_DIR
+  ];
+
+  for (const dir of possibleDirs) {
+    if (!dir || !fs.existsSync(dir)) continue;
+    const rPath = path.join(dir, targetFile);
+    if (fs.existsSync(rPath)) {
+      try {
+        const content = fs.readFileSync(rPath, 'utf-8');
+        const phone = JSON.parse(content).replace(/\D/g, '');
+        if (phone && phone.length >= 7) return phone;
+      } catch (e) {}
+    }
+  }
+
+  // Deep search in AUTH_DIR subfolders
+  try {
+    if (fs.existsSync(AUTH_DIR)) {
+      const subs = fs.readdirSync(AUTH_DIR);
+      for (const sub of subs) {
+        const fullSub = path.join(AUTH_DIR, sub);
+        if (fs.statSync(fullSub).isDirectory()) {
+          const rPath = path.join(fullSub, targetFile);
+          if (fs.existsSync(rPath)) {
+            const content = fs.readFileSync(rPath, 'utf-8');
+            const phone = JSON.parse(content).replace(/\D/g, '');
+            if (phone && phone.length >= 7) return phone;
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  return null;
+};
+
+const extractPhoneFromMsg = (msg, sessionId) => {
   const candidates = [
     msg.key?.remoteJidAlt,
     msg.key?.remoteJid,
@@ -65,16 +111,28 @@ const extractPhoneFromMsg = (msg) => {
     msg.key?.participant,
     msg.participant,
   ];
+
+  // 1. Check for direct @s.whatsapp.net phone number candidates first
   for (const cand of candidates) {
     if (cand && typeof cand === 'string' && cand.includes('@s.whatsapp.net')) {
       const phone = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
-      if (phone) return phone;
+      if (phone && phone.length >= 7 && !phone.startsWith('1000')) return phone;
     }
   }
+
+  // 2. Resolve @lid candidates using Baileys session LID mappings
+  for (const cand of candidates) {
+    if (cand && typeof cand === 'string' && cand.includes('@lid')) {
+      const resolvedPhone = resolvePhoneFromLid(cand, sessionId);
+      if (resolvedPhone) return resolvedPhone;
+    }
+  }
+
+  // 3. Fallback for non-lid candidates
   for (const cand of candidates) {
     if (cand && typeof cand === 'string' && !cand.endsWith('@lid')) {
       const phone = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
-      if (phone) return phone;
+      if (phone && phone.length >= 7) return phone;
     }
   }
   return null;
@@ -149,10 +207,19 @@ async function drainSessionQueue(sessionId) {
       await delay(initialWait);
 
       await session.sock.sendPresenceUpdate('composing', recipientJid);
-      const typingDuration = Math.min(msg.message.length * 40, 6000);
+      const typingDuration = Math.min((msg.message || '').length * 40, 6000);
       await delay(typingDuration);
 
-      await session.sock.sendMessage(recipientJid, { text: msg.message });
+      if (msg.media_url) {
+        log('📷', `[Session ${sessionId}] Sending media attachment (${msg.media_url}) to ${recipientJid}`);
+        await session.sock.sendMessage(recipientJid, {
+          image: { url: msg.media_url },
+          caption: msg.message || ''
+        });
+      } else {
+        await session.sock.sendMessage(recipientJid, { text: msg.message });
+      }
+
       await session.sock.sendPresenceUpdate('paused', recipientJid);
       totalMessagesSent++;
 
@@ -393,7 +460,7 @@ function isViewOnceMessage(msg) {
 async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
   if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
-  const senderPhoneRaw = extractPhoneFromMsg(msg);
+  const senderPhoneRaw = extractPhoneFromMsg(msg, sessionId);
   if (!senderPhoneRaw) return;
 
   const messageContent = unwrapMessage(msg.message);
