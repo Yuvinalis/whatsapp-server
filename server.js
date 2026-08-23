@@ -363,6 +363,16 @@ async function getCachedLeads() {
   return leadsCacheData || [];
 }
 
+function unwrapMessage(m) {
+  if (!m) return m;
+  if (m.ephemeralMessage?.message) return unwrapMessage(m.ephemeralMessage.message);
+  if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
+  if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
+  if (m.viewOnceMessageV2Extension?.message) return unwrapMessage(m.viewOnceMessageV2Extension.message);
+  if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
+  return m;
+}
+
 // Helper to process incoming, outgoing, or historic WhatsApp messages
 async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
   if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast') return;
@@ -370,27 +380,34 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
   const senderPhoneRaw = extractPhoneFromMsg(msg);
   if (!senderPhoneRaw) return;
 
+  const messageContent = unwrapMessage(msg.message);
+  if (!messageContent) return;
+
   const isFromMe = !!msg.key.fromMe;
   const senderType = isFromMe ? 'agent' : 'lead';
 
-  let text = msg.message.conversation ||
-    msg.message.extendedTextMessage?.text ||
-    msg.message.imageMessage?.caption ||
-    msg.message.videoMessage?.caption ||
-    msg.message.documentMessage?.caption ||
-    msg.message.buttonsResponseMessage?.selectedDisplayText ||
-    msg.message.listResponseMessage?.title ||
-    msg.message.templateButtonReplyMessage?.selectedDisplayText ||
+  let text = messageContent.conversation ||
+    messageContent.extendedTextMessage?.text ||
+    messageContent.extendedTextMessage?.matchedText ||
+    messageContent.imageMessage?.caption ||
+    messageContent.videoMessage?.caption ||
+    messageContent.documentMessage?.caption ||
+    messageContent.buttonsResponseMessage?.selectedDisplayText ||
+    messageContent.listResponseMessage?.title ||
+    messageContent.templateButtonReplyMessage?.selectedDisplayText ||
+    messageContent.interactiveResponseMessage?.body?.text ||
+    messageContent.reactionMessage?.text ||
     '';
 
   if (!text.trim()) {
-    if (msg.message.imageMessage) text = '📷 [Image Attachment]';
-    else if (msg.message.videoMessage) text = '🎥 [Video Attachment]';
-    else if (msg.message.audioMessage) text = '🎵 [Audio Message]';
-    else if (msg.message.documentMessage) text = '📄 [Document Attachment]';
-    else if (msg.message.stickerMessage) text = '🎨 [Sticker]';
-    else if (msg.message.contactMessage || msg.message.contactsArrayMessage) text = '🎴 [Contact Card]';
-    else if (msg.message.locationMessage || msg.message.liveLocationMessage) text = '📍 [Location Pin]';
+    if (messageContent.imageMessage) text = '📷 [Image Attachment]';
+    else if (messageContent.videoMessage) text = '🎥 [Video Attachment]';
+    else if (messageContent.audioMessage) text = '🎵 [Audio Message]';
+    else if (messageContent.documentMessage) text = '📄 [Document Attachment]';
+    else if (messageContent.stickerMessage) text = '🎨 [Sticker]';
+    else if (messageContent.contactMessage || messageContent.contactsArrayMessage) text = '🎴 [Contact Card]';
+    else if (messageContent.locationMessage || messageContent.liveLocationMessage) text = '📍 [Location Pin]';
+    else if (messageContent.reactionMessage) text = `👍 ${messageContent.reactionMessage.text || 'Reaction'}`;
     else text = '💬 [Message]';
   }
 
@@ -450,11 +467,11 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
   // Process & Download Media / Attachments (Images, Audio, Video, Documents, Stickers)
   let mediaUrl = null;
   const isMediaMsg = !!(
-    msg.message?.imageMessage ||
-    msg.message?.videoMessage ||
-    msg.message?.audioMessage ||
-    msg.message?.documentMessage ||
-    msg.message?.stickerMessage
+    messageContent.imageMessage ||
+    messageContent.videoMessage ||
+    messageContent.audioMessage ||
+    messageContent.documentMessage ||
+    messageContent.stickerMessage
   );
 
   if (isMediaMsg && typeof downloadMediaMessage === 'function') {
@@ -469,21 +486,21 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
       if (buffer && buffer.length > 0) {
         let ext = 'bin';
         let mimeType = 'application/octet-stream';
-        if (msg.message.imageMessage) {
+        if (messageContent.imageMessage) {
           ext = 'jpg';
-          mimeType = msg.message.imageMessage.mimetype || 'image/jpeg';
-        } else if (msg.message.audioMessage) {
+          mimeType = messageContent.imageMessage.mimetype || 'image/jpeg';
+        } else if (messageContent.audioMessage) {
           ext = 'mp3';
-          mimeType = msg.message.audioMessage.mimetype || 'audio/ogg';
-        } else if (msg.message.videoMessage) {
+          mimeType = messageContent.audioMessage.mimetype || 'audio/ogg';
+        } else if (messageContent.videoMessage) {
           ext = 'mp4';
-          mimeType = msg.message.videoMessage.mimetype || 'video/mp4';
-        } else if (msg.message.stickerMessage) {
+          mimeType = messageContent.videoMessage.mimetype || 'video/mp4';
+        } else if (messageContent.stickerMessage) {
           ext = 'webp';
           mimeType = 'image/webp';
-        } else if (msg.message.documentMessage) {
-          mimeType = msg.message.documentMessage.mimetype || 'application/pdf';
-          const docName = msg.message.documentMessage.fileName || 'document.pdf';
+        } else if (messageContent.documentMessage) {
+          mimeType = messageContent.documentMessage.mimetype || 'application/pdf';
+          const docName = messageContent.documentMessage.fileName || 'document.pdf';
           ext = docName.includes('.') ? docName.split('.').pop() : 'pdf';
         }
 
@@ -497,7 +514,7 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
         if (!uploadErr) {
           const { data: publicData } = supabase.storage.from('media').getPublicUrl(storagePath);
           mediaUrl = publicData?.publicUrl || null;
-          log('📎', `[Session ${sessionId}] Downloaded media and stored at ${mediaUrl}`);
+          log('📎', `[Session ${sessionId}] Downloaded media (${ext}) and stored at ${mediaUrl}`);
         } else {
           log('⚠️', `[Session ${sessionId}] Supabase media upload error: ${uploadErr.message}`);
         }
