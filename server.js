@@ -242,16 +242,106 @@ async function updateSessionStatus(sessionId, updates) {
  * Restores auth files from Supabase (whatsapp_sessions table) to local auth_sessions folder
  */
 async function restoreAuthFromSupabase(sessionId) {
-  const sessionAuthDir = path.join(AUTH_DIR, sessionId);
-  const credsFile = path.join(sessionAuthDir, 'creds.json');
-  return fs.existsSync(credsFile);
+  try {
+    const sessionAuthDir = path.join(AUTH_DIR, sessionId === 'default' ? '' : sessionId);
+    const credsFile = path.join(sessionAuthDir, 'creds.json');
+
+    // If local creds file already exists and is valid, no need to overwrite
+    if (fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10) {
+      return true;
+    }
+
+    log('📥', `[Session ${sessionId}] Attempting auth restoration from Supabase DB...`);
+
+    const { data: dbSess, error } = await supabase
+      .from('whatsapp_sessions')
+      .select('auth_data, parent_session_id')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+
+    if (error || !dbSess) {
+      log('ℹ️', `[Session ${sessionId}] No DB record found for auth restoration.`);
+      return false;
+    }
+
+    let authData = dbSess.auth_data;
+
+    // If this is a child session sharing a parent session, fetch parent's auth_data
+    if (!authData && dbSess.parent_session_id) {
+      const { data: parentDb } = await supabase
+        .from('whatsapp_sessions')
+        .select('auth_data')
+        .eq('session_id', dbSess.parent_session_id)
+        .maybeSingle();
+      if (parentDb) authData = parentDb.auth_data;
+    }
+
+    if (!authData || typeof authData !== 'object' || Object.keys(authData).length === 0) {
+      log('ℹ️', `[Session ${sessionId}] DB record has no auth_data payload.`);
+      return false;
+    }
+
+    // Ensure target folder exists
+    if (!fs.existsSync(sessionAuthDir)) {
+      fs.mkdirSync(sessionAuthDir, { recursive: true });
+    }
+
+    let restoredCount = 0;
+    for (const [fileName, fileContent] of Object.entries(authData)) {
+      if (!fileName || !fileContent) continue;
+      const filePath = path.join(sessionAuthDir, fileName);
+      const strContent = typeof fileContent === 'string' ? fileContent : JSON.stringify(fileContent);
+      fs.writeFileSync(filePath, strContent, 'utf-8');
+      restoredCount++;
+    }
+
+    log('✅', `[Session ${sessionId}] Successfully restored ${restoredCount} auth file(s) from Supabase DB to ${sessionAuthDir}`);
+    return true;
+  } catch (err) {
+    log('❌', `[Session ${sessionId}] Failed to restore auth from Supabase DB: ${err.message}`);
+    return false;
+  }
 }
 
 /**
  * Saves current local auth files to Supabase (whatsapp_sessions table)
  */
 async function saveAuthToSupabase(sessionId) {
-  // Credentials are store locally in auth_sessions folder
+  try {
+    const sessionAuthDir = path.join(AUTH_DIR, sessionId === 'default' ? '' : sessionId);
+    const credsFile = path.join(sessionAuthDir, 'creds.json');
+
+    if (!fs.existsSync(credsFile) || fs.statSync(credsFile).size <= 10) {
+      return;
+    }
+
+    const files = fs.readdirSync(sessionAuthDir).filter(f => f.endsWith('.json'));
+    if (!files.length) return;
+
+    const fileMap = {};
+    for (const fileName of files) {
+      const filePath = path.join(sessionAuthDir, fileName);
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        fileMap[fileName] = JSON.parse(content);
+      } catch (pErr) {
+        fileMap[fileName] = fs.readFileSync(filePath, 'utf-8');
+      }
+    }
+
+    const { error } = await supabase
+      .from('whatsapp_sessions')
+      .update({
+        auth_data: fileMap,
+        updated_at: new Date().toISOString()
+      })
+      .eq('session_id', sessionId);
+
+    if (error) throw error;
+    log('💾', `[Session ${sessionId}] Successfully backed up ${Object.keys(fileMap).length} auth file(s) to Supabase DB.`);
+  } catch (err) {
+    log('❌', `[Session ${sessionId}] Failed to backup auth to Supabase DB: ${err.message}`);
+  }
 }
 
 // Helper to process incoming, outgoing, or historic WhatsApp messages
@@ -780,19 +870,15 @@ async function validateAllDatabaseSessions() {
         continue;
       }
 
-      const sessionAuthDir = path.join(AUTH_DIR, id);
-      const credsFile = fs.existsSync(path.join(sessionAuthDir, 'creds.json'))
-        ? path.join(sessionAuthDir, 'creds.json')
-        : path.join(AUTH_DIR, 'creds.json');
-      const hasAuthCreds = fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10;
+      const hasAuthCreds = await restoreAuthFromSupabase(id);
 
       if (hasAuthCreds) {
         if (!memSess?.isConnecting) {
-          log('🔄', `[Session Validator] Idle credentials found for session ${id} — auto-reconnecting...`);
+          log('🔄', `[Session Validator] Auth restored for session ${id} — auto-reconnecting...`);
           startConnection(id);
         }
       } else {
-        log('⚠️', `[Session Validator] Marking idle session ${id} as disconnected in database`);
+        log('⚠️', `[Session Validator] Marking unlinked session ${id} as disconnected in database`);
         await updateSessionStatus(id, { status: 'disconnected', phone: null });
         if (sessions[id]) delete sessions[id];
       }
@@ -1575,28 +1661,25 @@ app.listen(PORT, async () => {
 
 
 
-  // Scan and reconnect root credentials session if present
-  if (fs.existsSync(path.join(AUTH_DIR, 'creds.json')) && fs.statSync(path.join(AUTH_DIR, 'creds.json')).size > 10) {
-    log('🔄', 'Found active root WhatsApp auth session — auto-reconnecting default session...');
-    startConnection('default');
-  }
+  // Restore all saved auth sessions from Supabase DB on boot
+  try {
+    const { data: dbSessions } = await supabase
+      .from('whatsapp_sessions')
+      .select('session_id, status, auth_data')
+      .not('auth_data', 'is', null);
 
-  // Scan and reconnect all saved sub-sessions
-  const subdirs = fs.readdirSync(AUTH_DIR).filter(file => {
-    return fs.statSync(path.join(AUTH_DIR, file)).isDirectory();
-  });
-
-  for (const sessionId of subdirs) {
-    const sessionAuthDir = path.join(AUTH_DIR, sessionId);
-    const credsFile = path.join(sessionAuthDir, 'creds.json');
-    if (fs.existsSync(credsFile) && fs.statSync(credsFile).size > 10) {
-      log('🔄', `Found valid active auth session for ${sessionId} — auto-reconnecting...`);
-      startConnection(sessionId);
+    if (dbSessions && dbSessions.length > 0) {
+      log('🌐', `[Boot] Found ${dbSessions.length} session(s) in Supabase DB with auth backups — restoring...`);
+      for (const s of dbSessions) {
+        const restored = await restoreAuthFromSupabase(s.session_id);
+        if (restored) {
+          log('🔄', `[Boot] Restored and auto-connecting session ${s.session_id}...`);
+          startConnection(s.session_id);
+        }
+      }
     }
-  }
-
-  if (subdirs.length === 0) {
-    log('📱', 'No saved sessions found. Waiting for /connect calls to generate QR codes.');
+  } catch (bootErr) {
+    log('⚠️', `[Boot] Error restoring sessions from DB: ${bootErr.message}`);
   }
 
   // Periodic automatic validation loop to clean up dead/unlinked sessions from database safely
