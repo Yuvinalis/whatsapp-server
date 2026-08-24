@@ -62,38 +62,47 @@ const resolvePhoneFromLid = (lid, sessionId) => {
   const cleanLid = String(lid).split('@')[0].split(':')[0].replace(/\D/g, '');
   if (!cleanLid) return null;
 
-  const targetFile = `lid-mapping-${cleanLid}_reverse.json`;
+  const targetFiles = [
+    `lid-mapping-${cleanLid}_reverse.json`,
+    `lid-mapping-${cleanLid}.json`
+  ];
 
+  // Search in passed session folder first
   const possibleDirs = [
     path.join(AUTH_DIR, sessionId || ''),
-    path.join(AUTH_DIR, 'ff5318b9-b744-49a4-a349-3e727ee0077f'),
     AUTH_DIR
   ];
 
   for (const dir of possibleDirs) {
     if (!dir || !fs.existsSync(dir)) continue;
-    const rPath = path.join(dir, targetFile);
-    if (fs.existsSync(rPath)) {
-      try {
-        const content = fs.readFileSync(rPath, 'utf-8');
-        const phone = JSON.parse(content).replace(/\D/g, '');
-        if (phone && phone.length >= 7) return phone;
-      } catch (e) {}
+    for (const tf of targetFiles) {
+      const rPath = path.join(dir, tf);
+      if (fs.existsSync(rPath)) {
+        try {
+          const content = fs.readFileSync(rPath, 'utf-8');
+          const phone = JSON.parse(content).replace(/\D/g, '');
+          if (phone && phone.length >= 7) return phone;
+        } catch (e) {}
+      }
     }
   }
 
-  // Deep search in AUTH_DIR subfolders
+  // Deep search all auth_sessions subfolders recursively
   try {
     if (fs.existsSync(AUTH_DIR)) {
       const subs = fs.readdirSync(AUTH_DIR);
       for (const sub of subs) {
         const fullSub = path.join(AUTH_DIR, sub);
         if (fs.statSync(fullSub).isDirectory()) {
-          const rPath = path.join(fullSub, targetFile);
-          if (fs.existsSync(rPath)) {
-            const content = fs.readFileSync(rPath, 'utf-8');
-            const phone = JSON.parse(content).replace(/\D/g, '');
-            if (phone && phone.length >= 7) return phone;
+          for (const tf of targetFiles) {
+            const rPath = path.join(fullSub, tf);
+            if (fs.existsSync(rPath)) {
+              try {
+                const content = fs.readFileSync(rPath, 'utf-8');
+                const phone = JSON.parse(content).replace(/\D/g, '');
+                if (phone && phone.length >= 7) return phone;
+              } catch (e) {}
+            }
           }
         }
       }
@@ -517,13 +526,61 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
   }
 
   const matchedLeads = await getCachedLeads();
-  if (!matchedLeads || !matchedLeads.length) return;
-
-  const targetLead = matchedLeads.find((l) => {
+  let targetLead = (matchedLeads || []).find((l) => {
     return matchPhone(l.phone_number, senderPhoneRaw) || matchPhone(l.whatsapp_number, senderPhoneRaw);
   });
 
-  if (!targetLead) return;
+  // Direct database query fallback if cache missed
+  if (!targetLead) {
+    const { data: dbLeads } = await supabase
+      .from('marketing_leads')
+      .select('id, business_name, phone_number, whatsapp_number, sela_ai_enabled, agent_id, created_by');
+
+    if (dbLeads && dbLeads.length > 0) {
+      leadsCacheData = dbLeads;
+      leadsCacheTime = Date.now();
+      targetLead = dbLeads.find((l) => matchPhone(l.phone_number, senderPhoneRaw) || matchPhone(l.whatsapp_number, senderPhoneRaw));
+    }
+  }
+
+  // Auto-create marketing_lead for incoming WhatsApp messages from new leads
+  if (!targetLead && !isFromMe) {
+    log('➕', `[Session ${sessionId}] Incoming message from new lead (+${senderPhoneRaw}). Auto-creating lead...`);
+    try {
+      const formattedPhone = senderPhoneRaw.length === 10 && senderPhoneRaw.startsWith('0')
+        ? '254' + senderPhoneRaw.substring(1)
+        : senderPhoneRaw.length === 9
+        ? '254' + senderPhoneRaw
+        : senderPhoneRaw;
+
+      const { data: newLead, error: leadInsErr } = await supabase
+        .from('marketing_leads')
+        .insert({
+          business_name: `WhatsApp Lead (+${formattedPhone})`,
+          phone_number: formattedPhone,
+          whatsapp_number: formattedPhone,
+          status: 'new',
+          whatsapp_session_id: sessionId
+        })
+        .select()
+        .single();
+
+      if (!leadInsErr && newLead) {
+        targetLead = newLead;
+        leadsCacheData = null;
+        log('✅', `[Session ${sessionId}] Auto-created lead ${newLead.id} for +${formattedPhone}`);
+      } else if (leadInsErr) {
+        log('⚠️', `Auto-create lead insert error: ${leadInsErr.message}`);
+      }
+    } catch (createErr) {
+      log('❌', `Auto-create lead error: ${createErr.message}`);
+    }
+  }
+
+  if (!targetLead) {
+    log('⚠️', `[Session ${sessionId}] Could not match or create lead for sender ${senderPhoneRaw}`);
+    return;
+  }
 
   // Send Delivery Receipt (2 Gray Ticks on lead's WhatsApp) for incoming lead messages
   if (!isFromMe && msg.key.remoteJid && msg.key.id && sock) {
@@ -677,7 +734,22 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
   }
   const msgTimestamp = new Date(tsSec * 1000).toISOString();
 
-  if (pendingMatchId) {
+  // Optimistic message matching (for outgoing messages sent from app UI)
+  let pendingMatch = null;
+  if (isFromMe && msg.key.id) {
+    const { data: optMsg } = await supabase
+      .from('lead_chat_messages')
+      .select('id')
+      .eq('lead_id', targetLead.id)
+      .eq('sender_type', 'agent')
+      .eq('message_status', 'sending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    pendingMatch = optMsg || null;
+  }
+
+  if (pendingMatch) {
     const updatePayload = {
       wa_message_id: msg.key.id || null,
       message_status: 'sent',
@@ -688,8 +760,8 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     await supabase
       .from('lead_chat_messages')
       .update(updatePayload)
-      .eq('id', pendingMatchId);
-    log('✅', `[Session ${sessionId}] Linked optimistic message ${pendingMatchId} with wa_message_id ${msg.key.id}`);
+      .eq('id', pendingMatch.id);
+    log('✅', `[Session ${sessionId}] Linked optimistic message ${pendingMatch.id} with wa_message_id ${msg.key.id}`);
   } else {
     const { error: insErr } = await supabase.from('lead_chat_messages').insert({
       lead_id: targetLead.id,
@@ -704,6 +776,8 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
 
     if (insErr) {
       log('❌', `Failed to insert lead chat message: ${insErr.message}`);
+    } else {
+      log('✅', `[Session ${sessionId}] Saved ${senderType} WhatsApp msg in DB for lead "${targetLead.business_name}" (${targetLead.id})`);
     }
   }
 
