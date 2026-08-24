@@ -212,10 +212,29 @@ async function drainSessionQueue(sessionId) {
 
       if (msg.media_url) {
         log('📷', `[Session ${sessionId}] Sending media attachment (${msg.media_url}) to ${recipientJid}`);
-        await session.sock.sendMessage(recipientJid, {
-          image: { url: msg.media_url },
-          caption: msg.message || ''
-        });
+        const urlLower = String(msg.media_url).toLowerCase();
+        if (urlLower.match(/\.(mp4|webm|mov)(\?.*)?$/)) {
+          await session.sock.sendMessage(recipientJid, {
+            video: { url: msg.media_url },
+            caption: msg.message || ''
+          });
+        } else if (urlLower.match(/\.(mp3|ogg|wav|m4a|aac)(\?.*)?$/)) {
+          await session.sock.sendMessage(recipientJid, {
+            audio: { url: msg.media_url },
+            mimetype: 'audio/mp4'
+          });
+        } else if (urlLower.match(/\.(pdf|doc|docx|xls|xlsx|zip)(\?.*)?$/)) {
+          await session.sock.sendMessage(recipientJid, {
+            document: { url: msg.media_url },
+            mimetype: 'application/pdf',
+            fileName: 'attachment'
+          });
+        } else {
+          await session.sock.sendMessage(recipientJid, {
+            image: { url: msg.media_url },
+            caption: msg.message || ''
+          });
+        }
       } else {
         await session.sock.sendMessage(recipientJid, { text: msg.message });
       }
@@ -526,7 +545,7 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
     messageContent.stickerMessage
   );
 
-  if (isMediaMsg && typeof downloadMediaMessage === 'function') {
+  if (isMediaMsg) {
     try {
       let buffer = null;
 
@@ -537,24 +556,38 @@ async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
         messageTimestamp: msg.messageTimestamp
       };
 
-      try {
-        buffer = await downloadMediaMessage(
-          downloadMsg,
-          'buffer',
-          {},
-          { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
-        );
-      } catch (e1) {
-        log('⚠️', `[Session ${sessionId}] Primary downloadMediaMessage error: ${e1.message}. Retrying with original msg...`);
+      // 1. Prefer active socket's built-in downloadMediaMessage method if present
+      if (sock && typeof sock.downloadMediaMessage === 'function') {
+        try {
+          buffer = await sock.downloadMediaMessage(downloadMsg);
+        } catch (eSock1) {
+          try {
+            buffer = await sock.downloadMediaMessage(msg);
+          } catch (eSock2) {}
+        }
+      }
+
+      // 2. Fallback to standalone downloadMediaMessage function
+      if (!buffer && typeof downloadMediaMessage === 'function') {
         try {
           buffer = await downloadMediaMessage(
-            msg,
+            downloadMsg,
             'buffer',
             {},
             { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
           );
-        } catch (e2) {
-          log('⚠️', `[Session ${sessionId}] Fallback downloadMediaMessage error: ${e2.message}`);
+        } catch (e1) {
+          log('⚠️', `[Session ${sessionId}] Primary downloadMediaMessage error: ${e1.message}. Retrying with original msg...`);
+          try {
+            buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
+            );
+          } catch (e2) {
+            log('⚠️', `[Session ${sessionId}] Fallback downloadMediaMessage error: ${e2.message}`);
+          }
         }
       }
 
@@ -1714,9 +1747,9 @@ app.post('/sync-lead-chat', async (req, res) => {
 });
 
 // POST /send-message — Enqueue a single message for immediate async delivery
-// Body: { session_id, phone, message }
+// Body: { session_id, phone, message, media_url }
 app.post('/send-message', async (req, res) => {
-  const { session_id, phone, message } = req.body;
+  const { session_id, phone, message, media_url } = req.body;
   if (!phone || !message) {
     return res.status(400).json({ success: false, error: 'phone and message are required' });
   }
@@ -1751,7 +1784,7 @@ app.post('/send-message', async (req, res) => {
     });
   }
 
-  enqueueMessage(targetSessionId, { id: null, phone, message });
+  enqueueMessage(targetSessionId, { id: null, phone, message, media_url: media_url || null });
 
   res.status(202).json({
     success: true,
@@ -1867,6 +1900,7 @@ app.post('/process-queue', async (req, res) => {
           id: msg.id,
           phone: msg.phone,
           message: msg.message,
+          media_url: msg.media_url || null,
           retry_count: msg.retry_count || 0,
         });
         enqueued++;
