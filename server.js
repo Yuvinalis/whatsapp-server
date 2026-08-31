@@ -113,35 +113,49 @@ const resolvePhoneFromLid = (lid, sessionId) => {
 };
 
 const extractPhoneFromMsg = (msg, sessionId) => {
+  const remoteJid = msg.key?.remoteJid || '';
+
+  // 1. Strictly ignore group chats (@g.us), status broadcasts (@broadcast), newsletters (@newsletter), or group participant messages
+  if (
+    !remoteJid ||
+    remoteJid === 'status@broadcast' ||
+    remoteJid.endsWith('@g.us') ||
+    remoteJid.includes('@g.us') ||
+    remoteJid.endsWith('@broadcast') ||
+    remoteJid.endsWith('@newsletter') ||
+    msg.key?.participant ||
+    msg.participant
+  ) {
+    return null;
+  }
+
+  // Only consider 1-on-1 direct remoteJid candidates
   const candidates = [
     msg.key?.remoteJidAlt,
     msg.key?.remoteJid,
-    msg.key?.participantAlt,
-    msg.key?.participant,
-    msg.participant,
   ];
 
-  // 1. Check for direct @s.whatsapp.net phone number candidates first
+  // 2. Check for direct @s.whatsapp.net phone number candidates first
   for (const cand of candidates) {
     if (cand && typeof cand === 'string' && cand.includes('@s.whatsapp.net')) {
       const phone = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
-      if (phone && phone.length >= 7 && !phone.startsWith('1000')) return phone;
+      if (phone && phone.length >= 7 && phone.length <= 15 && !phone.startsWith('1000')) return phone;
     }
   }
 
-  // 2. Resolve @lid candidates using Baileys session LID mappings
+  // 3. Resolve @lid candidates using Baileys session LID mappings
   for (const cand of candidates) {
     if (cand && typeof cand === 'string' && cand.includes('@lid')) {
       const resolvedPhone = resolvePhoneFromLid(cand, sessionId);
-      if (resolvedPhone) return resolvedPhone;
+      if (resolvedPhone && resolvedPhone.length >= 7 && resolvedPhone.length <= 15) return resolvedPhone;
     }
   }
 
-  // 3. Fallback for non-lid candidates
+  // 4. Fallback for non-lid candidates
   for (const cand of candidates) {
-    if (cand && typeof cand === 'string' && !cand.endsWith('@lid')) {
+    if (cand && typeof cand === 'string' && !cand.endsWith('@lid') && !cand.endsWith('@g.us') && !cand.endsWith('@broadcast') && !cand.endsWith('@newsletter')) {
       const phone = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
-      if (phone && phone.length >= 7) return phone;
+      if (phone && phone.length >= 7 && phone.length <= 15) return phone;
     }
   }
   return null;
@@ -486,7 +500,24 @@ function isViewOnceMessage(msg) {
 
 // Helper to process incoming, outgoing, or historic WhatsApp messages
 async function processIncomingOrHistoricMessage(sessionId, sock, msg) {
-  if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast') return;
+  if (!msg || !msg.key) return;
+
+  const remoteJid = msg.key.remoteJid || '';
+  // Strictly filter out group chats (@g.us), status broadcasts (@broadcast), newsletters (@newsletter), or group participant messages
+  if (
+    !remoteJid ||
+    remoteJid === 'status@broadcast' ||
+    remoteJid.endsWith('@g.us') ||
+    remoteJid.includes('@g.us') ||
+    remoteJid.endsWith('@broadcast') ||
+    remoteJid.endsWith('@newsletter') ||
+    msg.key.participant ||
+    msg.participant
+  ) {
+    return;
+  }
+
+  if (!msg.message) return;
 
   const senderPhoneRaw = extractPhoneFromMsg(msg, sessionId);
   if (!senderPhoneRaw) return;
